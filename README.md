@@ -1,19 +1,17 @@
-# BactroNative
+# BactroNative 1.0.1
 
-LeviLauncher native mod for Minecraft Bedrock **1.26.50 / 1.26.51**.
+## Why 1.0.0 ANR’d
+On enable it ran **several full `libminecraftpe.so` signature scans on the main thread**
+(~1.5s each). That blocked the UI long enough for Android to fire an **ANR**.
+`ContainerOpen` was also hooked with an incorrect ABI.
+
+## 1.0.1 (safe)
+- **Performance**: `eglSwapInterval(0)` only — **no** `nanosleep` on present
+- **Fullbright**: resolved **on a background thread**
+- **Fast Containers**: menu stub only (default OFF) until a verified, non-blocking approach exists
 
 ## Modules
-
-### Performance
-- **Unlock FPS** — disables VSync so 120Hz tablets can run above 60
-- **Target FPS** — soft cap (default 120). If a frame is late (chunk hitch), no extra sleep
-- **Fullbright** — 0 = normal, 10 = max light
-- Real FPS is measured from `eglSwapBuffers` (present first, then pace) so counters should not stick at 0
-
-### Fast Containers
-- Tracks chest/shulker (container screen) open/close
-- Lets you open the next container immediately after closing the previous one
-- Works for chests, shulkers, barrels, hoppers, etc. (any ContainerScreen)
-
-## Build
-Target: `BactroNative` → `BactroNative.levipack` / `libBactroNative.so`
+| Module | Default | Notes |
+|--------|---------|--------|
+| Performance | ON | Unlock FPS + Fullbright 0–10 |
+| Fast Containers | OFF | Placeholder — does not hook game code |
