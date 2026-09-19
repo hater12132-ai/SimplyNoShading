@@ -7,12 +7,15 @@
 #include <pl/memory/Signature.hpp>
 
 #include <android/log.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,11 +37,21 @@ std::array<FaceHook, 6> g_faces{};
 TessColorFn g_colorOriginal = nullptr;
 bool g_colorInstalled = false;
 
-std::atomic_bool g_enabled{false};
-std::atomic<float> g_strength{0.45f};
-std::atomic<float> g_sideBoost{0.20f};
-std::atomic_bool g_affectUpDown{true};
-std::atomic_bool g_affectSides{true};
+// Simply No Shading style: remove directional face darkening (0..1, 1 = full remove)
+std::atomic_bool g_noShadeEnabled{true};
+std::atomic<float> g_noShadeAmount{1.0f};
+
+// Fullbright 0..10 (0 = vanilla, 10 = max light everywhere)
+std::atomic<float> g_fullbright{0.0f};
+std::atomic_bool g_hooksReady{false};
+
+void* g_fullbrightTarget = nullptr;
+uint8_t g_fullbrightOriginal[12]{};
+bool g_fullbrightPatched = false;
+
+// Vanilla-ish directional shade factors (Java/Bedrock block face shading).
+// Down, Up, North, South, West, East
+constexpr float kFaceShade[6] = {0.50f, 1.00f, 0.80f, 0.80f, 0.60f, 0.60f};
 
 thread_local int g_activeFace = -1;
 
@@ -50,29 +63,79 @@ std::uintptr_t resolveOne(std::string_view pattern) {
     return (it != map.end()) ? it->second : 0;
 }
 
-void applyShade(float& r, float& g, float& b) {
-    if (!g_enabled.load(std::memory_order_relaxed)) return;
+bool patchMemory(void* target, const void* data, size_t size) {
+    if (!target || !data || size == 0) return false;
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) return false;
+    const auto addr = reinterpret_cast<std::uintptr_t>(target);
+    const auto page = reinterpret_cast<void*>(addr & ~(static_cast<std::uintptr_t>(pageSize) - 1));
+    const size_t len = (addr + size) - reinterpret_cast<std::uintptr_t>(page) + pageSize;
+    if (mprotect(page, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    std::memcpy(target, data, size);
+    __builtin___clear_cache(reinterpret_cast<char*>(target),
+                            reinterpret_cast<char*>(target) + size);
+    return true;
+}
+
+void applyFullbrightPatch(bool enable) {
+    if (!g_fullbrightTarget) return;
+    if (enable && !g_fullbrightPatched) {
+        // Same 12-byte stub BedrockTools uses: return max brightness, RET
+        const uint8_t patch[12] = {
+            0x40, 0x8F, 0xA8, 0x52,
+            0x00, 0x00, 0x27, 0x1E,
+            0xC0, 0x03, 0x5F, 0xD6
+        };
+        if (patchMemory(g_fullbrightTarget, patch, sizeof(patch))) {
+            g_fullbrightPatched = true;
+            LOGI("fullbright patch ON");
+        }
+    } else if (!enable && g_fullbrightPatched) {
+        if (patchMemory(g_fullbrightTarget, g_fullbrightOriginal, 12)) {
+            g_fullbrightPatched = false;
+            LOGI("fullbright patch OFF");
+        }
+    }
+}
+
+void syncFullbrightFromSlider() {
+    // Slider 0..10 — only force max light at 10; partial uses color path below.
+    const float v = g_fullbright.load(std::memory_order_relaxed);
+    applyFullbrightPatch(v >= 9.5f);
+}
+
+void applyNoShading(float& r, float& g, float& b) {
+    if (!g_noShadeEnabled.load(std::memory_order_relaxed)) return;
     const int face = g_activeFace;
-    if (face < 0) return;
-    const bool side = face >= 2;
-    if (side && !g_affectSides.load(std::memory_order_relaxed)) return;
-    if (!side && !g_affectUpDown.load(std::memory_order_relaxed)) return;
+    if (face < 0 || face > 5) return;
 
-    float strength = g_strength.load(std::memory_order_relaxed);
-    if (side) strength += g_sideBoost.load(std::memory_order_relaxed);
-    strength = std::clamp(strength, 0.0f, 1.0f);
-    if (strength <= 0.001f) return;
+    const float amount = std::clamp(g_noShadeAmount.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    if (amount <= 0.001f) return;
 
-    const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-    if (lum <= 0.0001f) return;
-    const float lift = 1.0f + strength * (1.0f - std::clamp(lum, 0.0f, 1.0f));
-    r = std::min(1.0f, r * lift);
-    g = std::min(1.0f, g * lift);
-    b = std::min(1.0f, b * lift);
+    // Undo directional face multiplier while keeping biome tint ratios.
+    const float shade = kFaceShade[face];
+    if (shade < 0.999f && shade > 0.001f) {
+        const float inv = 1.0f / shade;
+        const float blend = 1.0f + (inv - 1.0f) * amount; // amount=1 → full undo
+        r = std::min(1.0f, r * blend);
+        g = std::min(1.0f, g * blend);
+        b = std::min(1.0f, b * blend);
+    }
+}
+
+void applyFullbrightColor(float& r, float& g, float& b) {
+    // Partial fullbright (slider 0..10) when not hard-patched: lift toward white.
+    const float level = std::clamp(g_fullbright.load(std::memory_order_relaxed), 0.0f, 10.0f);
+    if (level <= 0.01f || level >= 9.5f) return; // 10 uses memory patch
+    const float t = level / 10.0f;
+    r = r + (1.0f - r) * t;
+    g = g + (1.0f - g) * t;
+    b = b + (1.0f - b) * t;
 }
 
 void colorDetour(void* self, float r, float g, float b, float a) {
-    applyShade(r, g, b);
+    applyNoShading(r, g, b);
+    applyFullbrightColor(r, g, b);
     if (g_colorOriginal) g_colorOriginal(self, r, g, b, a);
 }
 
@@ -119,12 +182,12 @@ bool installAll() {
         shadefix::sigs::BlockTessellatorTessellateFaceEast,
     };
 
-    bool any = false;
+    bool anyFace = false;
     for (int i = 0; i < 6; ++i) {
         if (!g_faces[i].installed)
-            any = installFace(i, patterns[i], detours[i]) || any;
+            anyFace = installFace(i, patterns[i], detours[i]) || anyFace;
         else
-            any = true;
+            anyFace = true;
     }
 
     if (!g_colorInstalled) {
@@ -144,40 +207,55 @@ bool installAll() {
         }
     }
 
-    return any && g_colorInstalled;
+    if (!g_fullbrightTarget) {
+        const auto addr = resolveOne(shadefix::sigs::Fullbright);
+        if (!addr) {
+            LOGE("Fullbright signature not found");
+        } else {
+            g_fullbrightTarget = reinterpret_cast<void*>(addr);
+            std::memcpy(g_fullbrightOriginal, g_fullbrightTarget, 12);
+            LOGI("Fullbright target @ %p", g_fullbrightTarget);
+        }
+    }
+
+    syncFullbrightFromSlider();
+    g_hooksReady.store(anyFace && g_colorInstalled, std::memory_order_release);
+    return g_hooksReady.load(std::memory_order_relaxed);
 }
 
 void onToggle(std::string_view /*module_id*/, bool enabled) {
-    g_enabled.store(enabled, std::memory_order_release);
+    g_noShadeEnabled.store(enabled, std::memory_order_release);
     if (enabled) installAll();
+    if (!enabled) applyFullbrightPatch(false);
 }
 
 void onConfigChanged(std::string_view /*module_id*/, std::string_view key, std::string_view value) {
     try {
-        if (key == "strength") {
-            g_strength.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        } else if (key == "sideBoost") {
-            g_sideBoost.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        } else if (key == "affectUpDown") {
-            g_affectUpDown.store(value == "true" || value == "1", std::memory_order_relaxed);
-        } else if (key == "affectSides") {
-            g_affectSides.store(value == "true" || value == "1", std::memory_order_relaxed);
+        if (key == "noShadeAmount") {
+            g_noShadeAmount.store(std::clamp(std::stof(std::string(value)), 0.0f, 1.0f),
+                                  std::memory_order_relaxed);
+        } else if (key == "fullbright") {
+            g_fullbright.store(std::clamp(std::stof(std::string(value)), 0.0f, 10.0f),
+                               std::memory_order_relaxed);
+            syncFullbrightFromSlider();
         }
     } catch (...) {
     }
 }
 
 void registerMenu() {
-    pl::modmenu::ModuleBuilder builder("shadefix", "Shade Fix");
-    builder.description(std::string(shadefix::Description))
+    pl::modmenu::ModuleBuilder builder("shadefix", "Simply No Shading");
+    builder.description("Removes block face shading (Like Simply No Shading). Fullbright slider 0-10.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfigChanged);
 
-    builder.config("strength", "Strength", pl::modmenu::ConfigType::SliderFloat, "0.45", "0", "1", "");
-    builder.config("sideBoost", "Side boost", pl::modmenu::ConfigType::SliderFloat, "0.2", "0", "1", "");
-    builder.config("affectUpDown", "Affect up/down", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    builder.config("affectSides", "Affect sides", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    // 1 = fully undo directional face darkening (SNS default look)
+    builder.config("noShadeAmount", "No shading strength", pl::modmenu::ConfigType::SliderFloat,
+                   "1", "0", "1", "");
+    // 0 = normal dark, 10 = full fullbright
+    builder.config("fullbright", "Fullbright", pl::modmenu::ConfigType::SliderFloat,
+                   "0", "0", "10", "");
     builder.registerModule();
 }
 
@@ -198,18 +276,20 @@ public:
     bool enable(pl::mod::ModContext&) {
         registerMenu();
         const bool ok = installAll();
-        g_enabled.store(ok, std::memory_order_release);
+        g_noShadeEnabled.store(true, std::memory_order_release);
         LOGI("enable hooks=%s", ok ? "ok" : "partial/fail");
         return true;
     }
 
     bool disable(pl::mod::ModContext&) {
-        g_enabled.store(false, std::memory_order_release);
+        g_noShadeEnabled.store(false, std::memory_order_release);
+        applyFullbrightPatch(false);
         return true;
     }
 
     bool unload(pl::mod::ModContext&) {
-        g_enabled.store(false, std::memory_order_release);
+        g_noShadeEnabled.store(false, std::memory_order_release);
+        applyFullbrightPatch(false);
         return true;
     }
 };

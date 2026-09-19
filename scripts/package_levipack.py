@@ -17,7 +17,7 @@ def main() -> int:
         "type": "preload-native",
         "name": "ShadeFix",
         "author": "hater12132-ai",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "entry": "libShadeFix.so",
         "icon": "icon.png",
         "minecraft_versions": ["1.26.5X.X"],
