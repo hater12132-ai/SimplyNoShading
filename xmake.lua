@@ -15,7 +15,7 @@ package_end()
 add_requires("preloader")
 add_requires("fmt")
 
-target("Optimization")
+target("BactroNative")
     set_kind("shared")
     set_languages("c++20")
     set_strip("all")
@@ -36,6 +36,6 @@ target("Optimization")
             path.join(os.projectdir(), "scripts", "package_levipack.py"),
             "--library", target:targetfile(),
             "--icon", path.join(os.projectdir(), "assets", "icon.png"),
-            "--output", path.join(target:targetdir(), "Optimization.levipack"),
+            "--output", path.join(target:targetdir(), "BactroNative.levipack"),
         })
     end)

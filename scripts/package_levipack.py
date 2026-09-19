@@ -14,19 +14,20 @@ def main() -> int:
         return 1
     manifest = {
         "type": "preload-native",
-        "name": "Optimization",
+        "name": "BactroNative",
         "author": "hater12132-ai",
         "version": "1.0.0",
-        "entry": "libOptimization.so",
+        "entry": "libBactroNative.so",
         "icon": "icon.png",
         "minecraft_versions": ["1.26.5X.X"],
-        "description": "Performance: unlock FPS for 120Hz displays, fullbright slider, smoother frame pacing.",
+        "description": "Performance (real FPS unlock for 120Hz) + Fast Containers (chests/shulkers).",
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.exists(): out.unlink()
+    if out.exists():
+        out.unlink()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         z.writestr("manifest.json", json.dumps(manifest, indent=2) + "\n")
-        z.write(lib, "libOptimization.so")
+        z.write(lib, "libBactroNative.so")
         z.write(icon, "icon.png")
     print(out)
     return 0

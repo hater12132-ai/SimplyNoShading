@@ -27,6 +27,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Optimization-levipack
-          path: build/android/arm64-v8a/release/Optimization.levipack
+          name: BactroNative-levipack
+          path: build/android/arm64-v8a/release/BactroNative.levipack
           if-no-files-found: error
