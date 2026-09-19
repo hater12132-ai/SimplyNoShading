@@ -7,6 +7,7 @@
 #include <pl/memory/Signature.hpp>
 
 #include <android/log.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -146,28 +147,37 @@ bool installAll() {
     return any && g_colorInstalled;
 }
 
+void onToggle(std::string_view /*module_id*/, bool enabled) {
+    g_enabled.store(enabled, std::memory_order_release);
+    if (enabled) installAll();
+}
+
+void onConfigChanged(std::string_view /*module_id*/, std::string_view key, std::string_view value) {
+    try {
+        if (key == "strength") {
+            g_strength.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        } else if (key == "sideBoost") {
+            g_sideBoost.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        } else if (key == "affectUpDown") {
+            g_affectUpDown.store(value == "true" || value == "1", std::memory_order_relaxed);
+        } else if (key == "affectSides") {
+            g_affectSides.store(value == "true" || value == "1", std::memory_order_relaxed);
+        }
+    } catch (...) {
+    }
+}
+
 void registerMenu() {
     pl::modmenu::ModuleBuilder builder("shadefix", "Shade Fix");
     builder.description(std::string(shadefix::Description))
         .defaultEnabled(true)
-        .onToggle([](std::string_view /*id*/, bool enabled) {
-            g_enabled.store(enabled, std::memory_order_release);
-            if (enabled) installAll();
-        })
-        .onConfigChanged([](std::string_view key, std::string_view value) {
-            try {
-                if (key == "strength") g_strength.store(std::stof(std::string(value)), std::memory_order_relaxed);
-                else if (key == "sideBoost") g_sideBoost.store(std::stof(std::string(value)), std::memory_order_relaxed);
-                else if (key == "affectUpDown") g_affectUpDown.store(value == "true" || value == "1", std::memory_order_relaxed);
-                else if (key == "affectSides") g_affectSides.store(value == "true" || value == "1", std::memory_order_relaxed);
-            } catch (...) {}
-            return true;
-        });
+        .onToggle(onToggle)
+        .onConfigChanged(onConfigChanged);
 
-    builder.config("strength", "Strength", pl::modmenu::ConfigType::SliderFloat, "0.45", "0", "1");
-    builder.config("sideBoost", "Side boost", pl::modmenu::ConfigType::SliderFloat, "0.2", "0", "1");
-    builder.config("affectUpDown", "Affect up/down", pl::modmenu::ConfigType::Toggle, "true");
-    builder.config("affectSides", "Affect sides", pl::modmenu::ConfigType::Toggle, "true");
+    builder.config("strength", "Strength", pl::modmenu::ConfigType::SliderFloat, "0.45", "0", "1", "");
+    builder.config("sideBoost", "Side boost", pl::modmenu::ConfigType::SliderFloat, "0.2", "0", "1", "");
+    builder.config("affectUpDown", "Affect up/down", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    builder.config("affectSides", "Affect sides", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     builder.registerModule();
 }
 
