@@ -13,6 +13,7 @@ package("preloader")
 package_end()
 
 add_requires("preloader")
+add_requires("fmt")
 
 target("ShadeFix")
     set_kind("shared")
@@ -20,7 +21,7 @@ target("ShadeFix")
     set_strip("all")
     add_files("src/*.cpp")
     add_includedirs("include", {public = true})
-    add_packages("preloader")
+    add_packages("preloader", "fmt")
     if is_plat("android") then
         add_cxflags("-fPIC", "-Oz", "-ffunction-sections", "-fdata-sections", "-fno-rtti", "-fexceptions", "-w")
         add_shflags("-Wl,--gc-sections", "-Wl,-z,max-page-size=16384")
