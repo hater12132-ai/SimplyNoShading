@@ -42,9 +42,10 @@ std::atomic_bool g_affectSides{true};
 thread_local int g_activeFace = -1;
 
 std::uintptr_t resolveOne(std::string_view pattern) {
-    const std::string p(pattern);
-    const auto map = pl::memory::resolveSignatures({p}, "libminecraftpe.so");
-    const auto it = map.find(p);
+    std::vector<std::string> patterns;
+    patterns.emplace_back(std::string(pattern));
+    const auto map = pl::memory::resolveSignatures(patterns, "libminecraftpe.so");
+    const auto it = map.find(patterns[0]);
     return (it != map.end()) ? it->second : 0;
 }
 
