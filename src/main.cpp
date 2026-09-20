@@ -259,52 +259,75 @@ bool survivalModeInteractDetour(void* gm, void* target, const void* location) {
     return interactDetour(g_interactSurvival, gm, target, location);
 }
 
+bool tryHook(SignatureId id, void* detour, void** originalOut, const char* name, int& n) {
+    const auto addr = bactro::memory::resolve(id);
+    char line[192];
+    if (!addr) {
+        std::snprintf(line, sizeof(line), "FAIL %s: signature not found", name);
+        writeStatus(line);
+        LOGE("%s", line);
+        return false;
+    }
+    void* o = nullptr;
+    if (!bactro::memory::hook(id, detour, &o)) {
+        // Resolved but hook failed — often BedrockTools already hooked the same site
+        std::snprintf(line, sizeof(line), "FAIL %s: hook @%p (already hooked by another mod?)", name,
+                      reinterpret_cast<void*>(addr));
+        writeStatus(line);
+        LOGE("%s", line);
+        return false;
+    }
+    if (originalOut) *originalOut = o;
+    ++n;
+    std::snprintf(line, sizeof(line), "OK   %s @%p", name, reinterpret_cast<void*>(addr));
+    writeStatus(line);
+    LOGI("%s", line);
+    return true;
+}
+
 void installGameHooksFromResolved() {
     int n = 0;
     void* o = nullptr;
-    if (bactro::memory::hook(SignatureId::ContainerScreenControllerOpen,
-                             reinterpret_cast<void*>(&containerOpenDetour), &o)) {
+
+    o = nullptr;
+    if (tryHook(SignatureId::ContainerScreenControllerOpen,
+                reinterpret_cast<void*>(&containerOpenDetour), &o, "ContainerOpen", n))
         g_containerOpenOrig = reinterpret_cast<ScreenFn>(o);
-        ++n;
-        LOGI("hook ContainerOpen");
-    }
+
     o = nullptr;
-    if (bactro::memory::hook(SignatureId::ContainerScreenControllerDtor,
-                             reinterpret_cast<void*>(&containerCloseDetour), &o)) {
+    if (tryHook(SignatureId::ContainerScreenControllerDtor,
+                reinterpret_cast<void*>(&containerCloseDetour), &o, "ContainerClose", n))
         g_containerCloseOrig = reinterpret_cast<ScreenFn>(o);
-        ++n;
-        LOGI("hook ContainerClose");
-    }
+
     o = nullptr;
-    if (bactro::memory::hook(SignatureId::GameModeUseItemOn,
-                             reinterpret_cast<void*>(&gameModeUseItemOnDetour), &o)) {
+    if (tryHook(SignatureId::GameModeUseItemOn,
+                reinterpret_cast<void*>(&gameModeUseItemOnDetour), &o, "GameModeUseItemOn", n))
         g_useOnGame = reinterpret_cast<UseItemOnFn>(o);
-        ++n;
-        LOGI("hook GameModeUseItemOn");
-    }
+
     o = nullptr;
-    if (bactro::memory::hook(SignatureId::SurvivalModeUseItemOn,
-                             reinterpret_cast<void*>(&survivalModeUseItemOnDetour), &o)) {
+    if (tryHook(SignatureId::SurvivalModeUseItemOn,
+                reinterpret_cast<void*>(&survivalModeUseItemOnDetour), &o, "SurvivalUseItemOn", n))
         g_useOnSurvival = reinterpret_cast<UseItemOnFn>(o);
-        ++n;
-        LOGI("hook SurvivalUseItemOn");
-    }
+
     o = nullptr;
-    if (bactro::memory::hook(SignatureId::GameModeInteract,
-                             reinterpret_cast<void*>(&gameModeInteractDetour), &o)) {
+    if (tryHook(SignatureId::GameModeInteract,
+                reinterpret_cast<void*>(&gameModeInteractDetour), &o, "GameModeInteract", n))
         g_interactGame = reinterpret_cast<InteractFn>(o);
-        ++n;
-        LOGI("hook GameModeInteract");
-    }
+
     o = nullptr;
-    if (bactro::memory::hook(SignatureId::SurvivalModeInteract,
-                             reinterpret_cast<void*>(&survivalModeInteractDetour), &o)) {
+    if (tryHook(SignatureId::SurvivalModeInteract,
+                reinterpret_cast<void*>(&survivalModeInteractDetour), &o, "SurvivalInteract", n))
         g_interactSurvival = reinterpret_cast<InteractFn>(o);
-        ++n;
-        LOGI("hook SurvivalInteract");
+
+    // No open/close tracking → always allow retries (don't gate on container state)
+    if (!g_containerOpenOrig && !g_containerCloseOrig) {
+        g_readyForNextOpen.store(true, std::memory_order_release);
+        g_containerOpen.store(false, std::memory_order_release);
+        writeStatus("note: no open/close hooks — always-retry mode");
     }
+
     LOGI("Fast Containers hooks: %d/6", n);
-    char buf[128];
+    char buf[64];
     std::snprintf(buf, sizeof(buf), "hooks=%d/6", n);
     writeStatus(buf);
 }
