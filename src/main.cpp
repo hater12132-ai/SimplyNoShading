@@ -27,21 +27,19 @@ namespace {
 using bactro::memory::SignatureId;
 
 // -------- Performance --------
+// IMPORTANT: do NOT hook eglSwapBuffers — that made LeviLauncher's FPS counter show 0.
+// Only force eglSwapInterval(0) and optionally re-apply from NormalTick.
 std::atomic_bool g_perfEnabled{true};
 std::atomic_bool g_unlockFps{true};
-std::atomic<int> g_measuredFps{0};
 std::atomic<float> g_fullbright{0.0f};
 
-using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
 using EglSwapIntervalFn = EGLBoolean (*)(EGLDisplay, EGLint);
-EglSwapBuffersFn g_swapOriginal = nullptr;
-EglSwapIntervalFn g_swapInterval = nullptr;
-bool g_swapHooked = false;
-EGLDisplay g_intervalDisplay = EGL_NO_DISPLAY;
+EglSwapIntervalFn g_swapIntervalOriginal = nullptr;
+bool g_swapIntervalHooked = false;
 
-std::atomic<int> g_frameCount{0};
-timespec g_fpsWindowStart{};
-bool g_fpsWindowInit = false;
+using NormalTickFn = void (*)(void*);
+NormalTickFn g_tickOriginal = nullptr;
+bool g_tickHooked = false;
 
 void* g_fullbrightTarget = nullptr;
 uint8_t g_fullbrightOriginal[12]{};
@@ -51,7 +49,7 @@ std::atomic_bool g_sigsReady{false};
 // -------- Fast Containers --------
 std::atomic_bool g_fastContainers{true};
 std::atomic_bool g_containerOpen{false};
-std::atomic_bool g_readyForNextOpen{true}; // set on close; cleared when UI actually opens
+std::atomic_bool g_readyForNextOpen{true};
 std::atomic<int64_t> g_lastContainerCloseNs{0};
 
 struct InteractionResultValue {
@@ -75,8 +73,6 @@ int64_t monoNs() {
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
-// True when Fast Containers is on and we are allowed to start the next open
-// (chest/shulker UI is closed — either never opened or just closed after server accept).
 bool wantsFastOpen() {
     if (!g_fastContainers.load(std::memory_order_relaxed)) return false;
     if (g_containerOpen.load(std::memory_order_acquire)) return false;
@@ -120,60 +116,68 @@ void syncFullbright() {
     applyFullbrightPatch(g_fullbright.load(std::memory_order_relaxed) >= 9.5f);
 }
 
-void updateMeasuredFps() {
-    timespec now{};
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (!g_fpsWindowInit) {
-        g_fpsWindowStart = now;
-        g_fpsWindowInit = true;
-        g_frameCount.store(0, std::memory_order_relaxed);
-        return;
+EGLBoolean swapIntervalDetour(EGLDisplay display, EGLint interval) {
+    if (g_perfEnabled.load(std::memory_order_relaxed) &&
+        g_unlockFps.load(std::memory_order_relaxed)) {
+        interval = 0;
     }
-    const int frames = g_frameCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    const int64_t elapsed = (static_cast<int64_t>(now.tv_sec) - g_fpsWindowStart.tv_sec) * 1000000000LL +
-                            (now.tv_nsec - g_fpsWindowStart.tv_nsec);
-    if (elapsed >= 500000000LL) {
-        g_measuredFps.store(static_cast<int>((frames * 1000000000LL) / (elapsed > 0 ? elapsed : 1)),
-                            std::memory_order_relaxed);
-        g_frameCount.store(0, std::memory_order_relaxed);
-        g_fpsWindowStart = now;
-    }
+    return g_swapIntervalOriginal ? g_swapIntervalOriginal(display, interval) : EGL_FALSE;
 }
 
-EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
+void normalTickDetour(void* self) {
+    if (g_tickOriginal) g_tickOriginal(self);
     if (g_perfEnabled.load(std::memory_order_relaxed) &&
-        g_unlockFps.load(std::memory_order_relaxed) &&
-        display != EGL_NO_DISPLAY && g_swapInterval) {
-        if (display != g_intervalDisplay) {
-            g_swapInterval(display, 0);
-            g_intervalDisplay = display;
+        g_unlockFps.load(std::memory_order_relaxed)) {
+        EGLDisplay d = eglGetCurrentDisplay();
+        if (d != EGL_NO_DISPLAY) {
+            if (g_swapIntervalOriginal) g_swapIntervalOriginal(d, 0);
+            else eglSwapInterval(d, 0);
         }
     }
-    const EGLBoolean ok = g_swapOriginal ? g_swapOriginal(display, surface) : EGL_FALSE;
-    if (ok == EGL_TRUE) updateMeasuredFps();
-    return ok;
 }
 
-bool installSwapHook() {
-    if (g_swapHooked) return true;
+bool installSwapIntervalHook() {
+    if (g_swapIntervalHooked) return true;
     void* egl = dlopen("libEGL.so", RTLD_NOW);
     if (!egl) egl = dlopen("libEGL.so.1", RTLD_NOW);
-    if (!egl) return false;
-    void* swapSym = dlsym(egl, "eglSwapBuffers");
-    g_swapInterval = reinterpret_cast<EglSwapIntervalFn>(dlsym(egl, "eglSwapInterval"));
-    if (!swapSym) return false;
+    if (!egl) {
+        LOGE("dlopen libEGL failed");
+        return false;
+    }
+    void* sym = dlsym(egl, "eglSwapInterval");
+    if (!sym) {
+        LOGE("eglSwapInterval missing");
+        return false;
+    }
     void* orig = nullptr;
-    if (pl::memory::hook(swapSym, reinterpret_cast<void*>(&swapBuffersDetour), &orig) != 0) return false;
-    g_swapOriginal = reinterpret_cast<EglSwapBuffersFn>(orig);
-    g_swapHooked = true;
-    LOGI("eglSwapBuffers hooked");
+    if (pl::memory::hook(sym, reinterpret_cast<void*>(&swapIntervalDetour), &orig) != 0) {
+        LOGE("eglSwapInterval hook failed");
+        return false;
+    }
+    g_swapIntervalOriginal = reinterpret_cast<EglSwapIntervalFn>(orig);
+    g_swapIntervalHooked = true;
+    EGLDisplay d = eglGetCurrentDisplay();
+    if (d != EGL_NO_DISPLAY && g_swapIntervalOriginal) g_swapIntervalOriginal(d, 0);
+    LOGI("eglSwapInterval hooked (Levi FPS counter safe)");
     return true;
 }
 
-// ---- Fast Containers (BedrockTools ABIs) ----
+bool installTickHook() {
+    if (g_tickHooked) return true;
+    void* o = nullptr;
+    if (!bactro::memory::hook(SignatureId::NormalTick, reinterpret_cast<void*>(&normalTickDetour), &o)) {
+        LOGE("NormalTick hook failed (optional)");
+        return false;
+    }
+    g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
+    g_tickHooked = true;
+    LOGI("NormalTick hooked");
+    return true;
+}
+
+// ---- Fast Containers ----
 
 void* containerOpenDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
-    // UI open = server accepted this container. Hold boost until player closes it.
     g_containerOpen.store(true, std::memory_order_release);
     g_readyForNextOpen.store(false, std::memory_order_release);
     return g_containerOpenOrig ? g_containerOpenOrig(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
@@ -181,7 +185,6 @@ void* containerOpenDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void
 
 void* containerCloseDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
     void* r = g_containerCloseOrig ? g_containerCloseOrig(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
-    // Closed after a real open → immediately allow the next chest/shulker open.
     g_containerOpen.store(false, std::memory_order_release);
     g_readyForNextOpen.store(true, std::memory_order_release);
     g_lastContainerCloseNs.store(monoNs(), std::memory_order_release);
@@ -191,9 +194,6 @@ void* containerCloseDetour(void* a0, void* a1, void* a2, void* a3, void* a4, voi
 InteractionResultValue useOnDetour(UseItemOnFn original, void* gm, void* item, const void* pos,
                                    std::uint8_t face, const void* hit, const void* block, bool firstEvent) {
     if (!original) return {};
-
-    // After close (or before any open): force a fresh firstEvent pulse and retry
-    // a few times so multiplayer lag does not require waiting to re-tap.
     if (wantsFastOpen()) {
         InteractionResultValue result{};
         for (int i = 0; i < 3; ++i) {
@@ -202,7 +202,6 @@ InteractionResultValue useOnDetour(UseItemOnFn original, void* gm, void* item, c
         }
         return result;
     }
-
     return original(gm, item, pos, face, hit, block, firstEvent);
 }
 
@@ -278,7 +277,6 @@ void installGameHooksFromResolved() {
     LOGI("Fast Containers hooks: %d/6", n);
 }
 
-// One full-table resolve on a background thread (all ~125 BT patterns).
 void resolveEverythingAsync() {
     std::thread([] {
         LOGI("resolveAll starting (background)...");
@@ -286,7 +284,6 @@ void resolveEverythingAsync() {
         g_sigsReady.store(ok, std::memory_order_release);
         LOGI("resolveAll done ok=%d", ok ? 1 : 0);
 
-        // Fullbright
         const auto fb = bactro::memory::resolve(SignatureId::Fullbright);
         if (fb) {
             g_fullbrightTarget = reinterpret_cast<void*>(fb);
@@ -299,6 +296,8 @@ void resolveEverythingAsync() {
 
         if (g_fastContainers.load(std::memory_order_relaxed))
             installGameHooksFromResolved();
+        if (g_perfEnabled.load(std::memory_order_relaxed))
+            installTickHook();
     }).detach();
 }
 
@@ -306,13 +305,19 @@ void onPerfToggle(std::string_view, bool enabled) {
     g_perfEnabled.store(enabled, std::memory_order_release);
     if (!enabled) {
         applyFullbrightPatch(false);
-        if (g_swapInterval && g_intervalDisplay != EGL_NO_DISPLAY)
-            g_swapInterval(g_intervalDisplay, 1);
-        g_intervalDisplay = EGL_NO_DISPLAY;
+        EGLDisplay d = eglGetCurrentDisplay();
+        if (d != EGL_NO_DISPLAY) {
+            if (g_swapIntervalOriginal) g_swapIntervalOriginal(d, 1);
+            else eglSwapInterval(d, 1);
+        }
     } else {
-        installSwapHook();
-        if (!g_sigsReady.load()) resolveEverythingAsync();
-        else syncFullbright();
+        installSwapIntervalHook();
+        if (g_sigsReady.load()) {
+            installTickHook();
+            syncFullbright();
+        } else {
+            resolveEverythingAsync();
+        }
     }
 }
 
@@ -327,9 +332,11 @@ void onPerfConfig(std::string_view, std::string_view key, std::string_view value
     try {
         if (key == "unlockFps") {
             g_unlockFps.store(value == "true" || value == "1", std::memory_order_relaxed);
-            if (!g_unlockFps.load() && g_swapInterval && g_intervalDisplay != EGL_NO_DISPLAY) {
-                g_swapInterval(g_intervalDisplay, 1);
-                g_intervalDisplay = EGL_NO_DISPLAY;
+            EGLDisplay d = eglGetCurrentDisplay();
+            if (d != EGL_NO_DISPLAY) {
+                const EGLint iv = g_unlockFps.load() ? 0 : 1;
+                if (g_swapIntervalOriginal) g_swapIntervalOriginal(d, iv);
+                else eglSwapInterval(d, iv);
             }
         } else if (key == "fullbright") {
             g_fullbright.store(std::stof(std::string(value)), std::memory_order_relaxed);
@@ -344,7 +351,7 @@ void onFastConfig(std::string_view, std::string_view, std::string_view) {}
 void registerMenus() {
     {
         pl::modmenu::ModuleBuilder b("bactro.performance", "Performance");
-        b.description("Unlock FPS (VSync off) + Fullbright. Signatures resolved in background.")
+        b.description("VSync unlock via eglSwapInterval only (keeps Levi FPS counter working) + Fullbright.")
             .defaultEnabled(true)
             .onToggle(onPerfToggle)
             .onConfigChanged(onPerfConfig);
@@ -354,7 +361,7 @@ void registerMenus() {
     }
     {
         pl::modmenu::ModuleBuilder b("bactro.fastcontainers", "Fast Containers");
-        b.description("Close a chest/shulker after server opens it, then open the next with no client wait (MP-friendly).")
+        b.description("After server opens a chest/shulker, close and open the next with no client wait.")
             .defaultEnabled(true)
             .onToggle(onFastToggle)
             .onConfigChanged(onFastConfig);
@@ -372,14 +379,14 @@ public:
     }
 
     bool load(pl::mod::ModContext&) {
-        LOGI("load %s %s — full BT signature table embedded", bactro::Name.data(), bactro::Version.data());
+        LOGI("load %s %s", bactro::Name.data(), bactro::Version.data());
         return true;
     }
 
     bool enable(pl::mod::ModContext&) {
         registerMenus();
-        installSwapHook();
-        resolveEverythingAsync(); // all signatures, once, off main thread
+        installSwapIntervalHook();
+        resolveEverythingAsync();
         g_perfEnabled.store(true, std::memory_order_release);
         LOGI("BactroNative enabled");
         return true;
