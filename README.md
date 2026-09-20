@@ -1,20 +1,20 @@
-# BactroNative 1.1.0
+# BactroNative 1.2.1
 
-## Fast Containers (real)
-Uses **BedrockTools** signatures and calling conventions:
-- `ContainerScreenControllerOpen` / `Dtor` (8-arg ScreenFn)
-- `GameModeUseItemOn` / `SurvivalModeUseItemOn` (`InteractionResultValue(…)`)
-- `GameModeInteract` / `SurvivalModeInteract` (`bool(…)`)
+## Full signature table
+All **BedrockTools** `SignatureId` patterns for **1.26.50 / 1.26.51** are embedded.
 
-Resolved in **one background batch** (no main-thread multi-scan ANR).
+```cpp
+#include "bactro/Signatures.hpp"
+bactro::memory::resolveAll();                    // once, prefer background thread
+auto addr = bactro::memory::resolve(SignatureId::GameModeUseItemOn);
+bactro::memory::hook(SignatureId::..., detour, &original);
+```
 
-After you close a chest/shulker, the next use/interact is retried once if it fails
-(within 750ms) so you can hop containers faster.
+Resolved **once in the background** on enable (no main-thread ANR).
 
-## Performance
-- VSync unlock via `eglSwapInterval(0)`
-- Fullbright 0–10 (async signature resolve)
+## Modules
+- **Performance** — VSync unlock + Fullbright 0–10
+- **Fast Containers** — after closing a chest/shulker, next open forces `firstEvent` and retries once (client-side; works on multiplayer as far as the client can; server may still add a tick of latency)
 
-## Note
-If your build is 1.26.51.x and some signatures miss, logcat will show
-`Fast Containers hooks installed: N/6`. Need matching patterns for that build.
+## Multiplayer note
+The server still authorizes container opens. This mod removes **client** wait/fail between hops; it cannot remove network RTT.

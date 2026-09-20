@@ -1,10 +1,9 @@
-#include "Signatures.hpp"
+#include "bactro/Signatures.hpp"
 #include "Version.hpp"
 
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
 #include <pl/memory/Hook.hpp>
-#include <pl/memory/Signature.hpp>
 
 #include <EGL/egl.h>
 #include <android/log.h>
@@ -13,20 +12,19 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
-#include <vector>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "BactroNative", __VA_ARGS__)
 
 namespace {
+
+using bactro::memory::SignatureId;
 
 // -------- Performance --------
 std::atomic_bool g_perfEnabled{true};
@@ -48,17 +46,16 @@ bool g_fpsWindowInit = false;
 void* g_fullbrightTarget = nullptr;
 uint8_t g_fullbrightOriginal[12]{};
 bool g_fullbrightPatched = false;
-std::atomic_bool g_fullbrightReady{false};
+std::atomic_bool g_sigsReady{false};
 
-// -------- Fast Containers (BedrockTools ABIs) --------
+// -------- Fast Containers --------
 std::atomic_bool g_fastContainers{true};
 std::atomic_bool g_containerOpen{false};
+std::atomic_bool g_readyForNextOpen{true}; // set on close; cleared when UI actually opens
 std::atomic<int64_t> g_lastContainerCloseNs{0};
-std::atomic_bool g_containerHooksReady{false};
 
-// Exact types from BedrockTools GameHooks.cpp
 struct InteractionResultValue {
-    std::uint8_t value;
+    std::uint8_t value{};
 };
 
 using UseItemOnFn = InteractionResultValue (*)(void*, void*, const void*, std::uint8_t, const void*, const void*, bool);
@@ -72,42 +69,18 @@ InteractFn g_interactSurvival = nullptr;
 ScreenFn g_containerOpenOrig = nullptr;
 ScreenFn g_containerCloseOrig = nullptr;
 
-static bool interactionOk(InteractionResultValue r) {
-    // Bedrock InteractionResult: non-zero generally means swing/success path
-    return r.value != 0;
-}
-
-static int64_t monoNs() {
+int64_t monoNs() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
-static bool recentlyClosedContainer() {
-    const int64_t t = g_lastContainerCloseNs.load(std::memory_order_acquire);
-    if (t == 0) return false;
-    return (monoNs() - t) < 750000000LL; // 750ms window after close
-}
-
-std::uintptr_t resolveOne(std::string_view pattern) {
-    std::vector<std::string> patterns{std::string(pattern)};
-    const auto map = pl::memory::resolveSignatures(patterns, "libminecraftpe.so");
-    const auto it = map.find(patterns[0]);
-    return (it != map.end()) ? it->second : 0;
-}
-
-// One batch scan — avoids 6× main-thread scans that caused the ANR.
-std::unordered_map<std::string, std::uintptr_t> resolveBatch(const std::vector<std::string_view>& views) {
-    std::vector<std::string> patterns;
-    patterns.reserve(views.size());
-    for (auto v : views) patterns.emplace_back(v);
-    auto map = pl::memory::resolveSignatures(patterns, "libminecraftpe.so");
-    std::unordered_map<std::string, std::uintptr_t> out;
-    for (auto& p : patterns) {
-        auto it = map.find(p);
-        out[p] = (it != map.end()) ? it->second : 0;
-    }
-    return out;
+// True when Fast Containers is on and we are allowed to start the next open
+// (chest/shulker UI is closed — either never opened or just closed after server accept).
+bool wantsFastOpen() {
+    if (!g_fastContainers.load(std::memory_order_relaxed)) return false;
+    if (g_containerOpen.load(std::memory_order_acquire)) return false;
+    return g_readyForNextOpen.load(std::memory_order_acquire);
 }
 
 bool patchMemory(void* target, const void* data, size_t size) {
@@ -128,9 +101,7 @@ void applyFullbrightPatch(bool enable) {
     if (!g_fullbrightTarget) return;
     if (enable && !g_fullbrightPatched) {
         const uint8_t patch[12] = {
-            0x40, 0x8F, 0xA8, 0x52,
-            0x00, 0x00, 0x27, 0x1E,
-            0xC0, 0x03, 0x5F, 0xD6
+            0x40, 0x8F, 0xA8, 0x52, 0x00, 0x00, 0x27, 0x1E, 0xC0, 0x03, 0x5F, 0xD6
         };
         if (patchMemory(g_fullbrightTarget, patch, sizeof(patch))) {
             g_fullbrightPatched = true;
@@ -145,28 +116,8 @@ void applyFullbrightPatch(bool enable) {
 }
 
 void syncFullbright() {
-    if (!g_fullbrightReady.load(std::memory_order_acquire)) return;
+    if (!g_sigsReady.load(std::memory_order_acquire)) return;
     applyFullbrightPatch(g_fullbright.load(std::memory_order_relaxed) >= 9.5f);
-}
-
-void resolveFullbrightAsync() {
-    if (g_fullbrightTarget) {
-        g_fullbrightReady.store(true, std::memory_order_release);
-        syncFullbright();
-        return;
-    }
-    std::thread([] {
-        const auto addr = resolveOne(bactro::sigs::Fullbright);
-        if (!addr) {
-            LOGE("Fullbright signature not found");
-            return;
-        }
-        g_fullbrightTarget = reinterpret_cast<void*>(addr);
-        std::memcpy(g_fullbrightOriginal, g_fullbrightTarget, 12);
-        g_fullbrightReady.store(true, std::memory_order_release);
-        LOGI("Fullbright @ %p", g_fullbrightTarget);
-        syncFullbright();
-    }).detach();
 }
 
 void updateMeasuredFps() {
@@ -182,7 +133,7 @@ void updateMeasuredFps() {
     const int64_t elapsed = (static_cast<int64_t>(now.tv_sec) - g_fpsWindowStart.tv_sec) * 1000000000LL +
                             (now.tv_nsec - g_fpsWindowStart.tv_nsec);
     if (elapsed >= 500000000LL) {
-        g_measuredFps.store(static_cast<int>((frames * 1000000000LL) / std::max<int64_t>(elapsed, 1)),
+        g_measuredFps.store(static_cast<int>((frames * 1000000000LL) / (elapsed > 0 ? elapsed : 1)),
                             std::memory_order_relaxed);
         g_frameCount.store(0, std::memory_order_relaxed);
         g_fpsWindowStart = now;
@@ -198,7 +149,7 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
             g_intervalDisplay = display;
         }
     }
-    EGLBoolean ok = g_swapOriginal ? g_swapOriginal(display, surface) : EGL_FALSE;
+    const EGLBoolean ok = g_swapOriginal ? g_swapOriginal(display, surface) : EGL_FALSE;
     if (ok == EGL_TRUE) updateMeasuredFps();
     return ok;
 }
@@ -219,134 +170,135 @@ bool installSwapHook() {
     return true;
 }
 
-// ---- Fast Containers detours (correct ABIs from BedrockTools) ----
+// ---- Fast Containers (BedrockTools ABIs) ----
 
 void* containerOpenDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
+    // UI open = server accepted this container. Hold boost until player closes it.
     g_containerOpen.store(true, std::memory_order_release);
+    g_readyForNextOpen.store(false, std::memory_order_release);
     return g_containerOpenOrig ? g_containerOpenOrig(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
 }
 
 void* containerCloseDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
     void* r = g_containerCloseOrig ? g_containerCloseOrig(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
+    // Closed after a real open → immediately allow the next chest/shulker open.
     g_containerOpen.store(false, std::memory_order_release);
+    g_readyForNextOpen.store(true, std::memory_order_release);
     g_lastContainerCloseNs.store(monoNs(), std::memory_order_release);
     return r;
 }
 
-InteractionResultValue useOnBoost(UseItemOnFn original, void* gm, void* item, const void* pos,
-                                  std::uint8_t face, const void* hit, const void* block, bool firstEvent) {
+InteractionResultValue useOnDetour(UseItemOnFn original, void* gm, void* item, const void* pos,
+                                   std::uint8_t face, const void* hit, const void* block, bool firstEvent) {
     if (!original) return {};
-    auto result = original(gm, item, pos, face, hit, block, firstEvent);
 
-    // After closing a chest/shulker, the next block-use often needs a fresh
-    // firstEvent=true pulse. If the first call fails during the boost window,
-    // retry once with firstEvent forced on.
-    if (g_fastContainers.load(std::memory_order_relaxed) && recentlyClosedContainer() &&
-        !interactionOk(result)) {
-        result = original(gm, item, pos, face, hit, block, true);
+    // After close (or before any open): force a fresh firstEvent pulse and retry
+    // a few times so multiplayer lag does not require waiting to re-tap.
+    if (wantsFastOpen()) {
+        InteractionResultValue result{};
+        for (int i = 0; i < 3; ++i) {
+            result = original(gm, item, pos, face, hit, block, true);
+            if (result.value != 0) break;
+        }
+        return result;
     }
-    return result;
+
+    return original(gm, item, pos, face, hit, block, firstEvent);
 }
 
 InteractionResultValue gameModeUseItemOnDetour(void* gm, void* item, const void* pos, std::uint8_t face,
                                                const void* hit, const void* block, bool firstEvent) {
-    return useOnBoost(g_useOnGame, gm, item, pos, face, hit, block, firstEvent);
+    return useOnDetour(g_useOnGame, gm, item, pos, face, hit, block, firstEvent);
 }
 
 InteractionResultValue survivalModeUseItemOnDetour(void* gm, void* item, const void* pos, std::uint8_t face,
                                                    const void* hit, const void* block, bool firstEvent) {
-    return useOnBoost(g_useOnSurvival, gm, item, pos, face, hit, block, firstEvent);
+    return useOnDetour(g_useOnSurvival, gm, item, pos, face, hit, block, firstEvent);
 }
 
-bool interactBoost(InteractFn original, void* gm, void* target, const void* location) {
+bool interactDetour(InteractFn original, void* gm, void* target, const void* location) {
     if (!original) return false;
     bool result = original(gm, target, location);
-    if (g_fastContainers.load(std::memory_order_relaxed) && recentlyClosedContainer() && !result) {
-        result = original(gm, target, location);
-    }
+    if (wantsFastOpen() && !result) result = original(gm, target, location);
     return result;
 }
 
 bool gameModeInteractDetour(void* gm, void* target, const void* location) {
-    return interactBoost(g_interactGame, gm, target, location);
+    return interactDetour(g_interactGame, gm, target, location);
 }
 
 bool survivalModeInteractDetour(void* gm, void* target, const void* location) {
-    return interactBoost(g_interactSurvival, gm, target, location);
+    return interactDetour(g_interactSurvival, gm, target, location);
 }
 
-bool hookAt(std::uintptr_t addr, void* detour, void** originalOut, const char* name) {
-    if (!addr) {
-        LOGE("%s not found", name);
-        return false;
+void installGameHooksFromResolved() {
+    int n = 0;
+    void* o = nullptr;
+    if (bactro::memory::hook(SignatureId::ContainerScreenControllerOpen,
+                             reinterpret_cast<void*>(&containerOpenDetour), &o)) {
+        g_containerOpenOrig = reinterpret_cast<ScreenFn>(o);
+        ++n;
+        LOGI("hook ContainerOpen");
     }
-    if (pl::memory::hook(reinterpret_cast<void*>(addr), detour, originalOut) != 0) {
-        LOGE("%s hook failed", name);
-        return false;
+    o = nullptr;
+    if (bactro::memory::hook(SignatureId::ContainerScreenControllerDtor,
+                             reinterpret_cast<void*>(&containerCloseDetour), &o)) {
+        g_containerCloseOrig = reinterpret_cast<ScreenFn>(o);
+        ++n;
+        LOGI("hook ContainerClose");
     }
-    LOGI("%s @ %p", name, reinterpret_cast<void*>(addr));
-    return true;
+    o = nullptr;
+    if (bactro::memory::hook(SignatureId::GameModeUseItemOn,
+                             reinterpret_cast<void*>(&gameModeUseItemOnDetour), &o)) {
+        g_useOnGame = reinterpret_cast<UseItemOnFn>(o);
+        ++n;
+        LOGI("hook GameModeUseItemOn");
+    }
+    o = nullptr;
+    if (bactro::memory::hook(SignatureId::SurvivalModeUseItemOn,
+                             reinterpret_cast<void*>(&survivalModeUseItemOnDetour), &o)) {
+        g_useOnSurvival = reinterpret_cast<UseItemOnFn>(o);
+        ++n;
+        LOGI("hook SurvivalUseItemOn");
+    }
+    o = nullptr;
+    if (bactro::memory::hook(SignatureId::GameModeInteract,
+                             reinterpret_cast<void*>(&gameModeInteractDetour), &o)) {
+        g_interactGame = reinterpret_cast<InteractFn>(o);
+        ++n;
+        LOGI("hook GameModeInteract");
+    }
+    o = nullptr;
+    if (bactro::memory::hook(SignatureId::SurvivalModeInteract,
+                             reinterpret_cast<void*>(&survivalModeInteractDetour), &o)) {
+        g_interactSurvival = reinterpret_cast<InteractFn>(o);
+        ++n;
+        LOGI("hook SurvivalInteract");
+    }
+    LOGI("Fast Containers hooks: %d/6", n);
 }
 
-void installContainerHooksAsync() {
-    if (g_containerHooksReady.load(std::memory_order_acquire)) return;
+// One full-table resolve on a background thread (all ~125 BT patterns).
+void resolveEverythingAsync() {
     std::thread([] {
-        // Single batch resolve — safe, not on UI thread
-        const std::vector<std::string_view> views = {
-            bactro::sigs::ContainerScreenControllerOpen,
-            bactro::sigs::ContainerScreenControllerDtor,
-            bactro::sigs::GameModeUseItemOn,
-            bactro::sigs::SurvivalModeUseItemOn,
-            bactro::sigs::GameModeInteract,
-            bactro::sigs::SurvivalModeInteract,
-        };
-        auto map = resolveBatch(views);
+        LOGI("resolveAll starting (background)...");
+        const bool ok = bactro::memory::resolveAll("libminecraftpe.so");
+        g_sigsReady.store(ok, std::memory_order_release);
+        LOGI("resolveAll done ok=%d", ok ? 1 : 0);
 
-        auto get = [&](std::string_view p) -> std::uintptr_t {
-            auto it = map.find(std::string(p));
-            return it != map.end() ? it->second : 0;
-        };
-
-        void* o = nullptr;
-        int n = 0;
-        if (hookAt(get(bactro::sigs::ContainerScreenControllerOpen),
-                   reinterpret_cast<void*>(&containerOpenDetour), &o, "ContainerOpen")) {
-            g_containerOpenOrig = reinterpret_cast<ScreenFn>(o);
-            ++n;
-        }
-        o = nullptr;
-        if (hookAt(get(bactro::sigs::ContainerScreenControllerDtor),
-                   reinterpret_cast<void*>(&containerCloseDetour), &o, "ContainerClose")) {
-            g_containerCloseOrig = reinterpret_cast<ScreenFn>(o);
-            ++n;
-        }
-        o = nullptr;
-        if (hookAt(get(bactro::sigs::GameModeUseItemOn),
-                   reinterpret_cast<void*>(&gameModeUseItemOnDetour), &o, "GameModeUseItemOn")) {
-            g_useOnGame = reinterpret_cast<UseItemOnFn>(o);
-            ++n;
-        }
-        o = nullptr;
-        if (hookAt(get(bactro::sigs::SurvivalModeUseItemOn),
-                   reinterpret_cast<void*>(&survivalModeUseItemOnDetour), &o, "SurvivalUseItemOn")) {
-            g_useOnSurvival = reinterpret_cast<UseItemOnFn>(o);
-            ++n;
-        }
-        o = nullptr;
-        if (hookAt(get(bactro::sigs::GameModeInteract),
-                   reinterpret_cast<void*>(&gameModeInteractDetour), &o, "GameModeInteract")) {
-            g_interactGame = reinterpret_cast<InteractFn>(o);
-            ++n;
-        }
-        o = nullptr;
-        if (hookAt(get(bactro::sigs::SurvivalModeInteract),
-                   reinterpret_cast<void*>(&survivalModeInteractDetour), &o, "SurvivalInteract")) {
-            g_interactSurvival = reinterpret_cast<InteractFn>(o);
-            ++n;
+        // Fullbright
+        const auto fb = bactro::memory::resolve(SignatureId::Fullbright);
+        if (fb) {
+            g_fullbrightTarget = reinterpret_cast<void*>(fb);
+            std::memcpy(g_fullbrightOriginal, g_fullbrightTarget, 12);
+            LOGI("Fullbright @ %p", g_fullbrightTarget);
+            syncFullbright();
+        } else {
+            LOGE("Fullbright missing");
         }
 
-        g_containerHooksReady.store(n > 0, std::memory_order_release);
-        LOGI("Fast Containers hooks installed: %d/6", n);
+        if (g_fastContainers.load(std::memory_order_relaxed))
+            installGameHooksFromResolved();
     }).detach();
 }
 
@@ -359,13 +311,15 @@ void onPerfToggle(std::string_view, bool enabled) {
         g_intervalDisplay = EGL_NO_DISPLAY;
     } else {
         installSwapHook();
-        resolveFullbrightAsync();
+        if (!g_sigsReady.load()) resolveEverythingAsync();
+        else syncFullbright();
     }
 }
 
 void onFastToggle(std::string_view, bool enabled) {
     g_fastContainers.store(enabled, std::memory_order_release);
-    if (enabled) installContainerHooksAsync();
+    if (enabled && g_sigsReady.load()) installGameHooksFromResolved();
+    if (enabled && !g_sigsReady.load()) resolveEverythingAsync();
     LOGI("Fast Containers %s", enabled ? "ON" : "OFF");
 }
 
@@ -378,8 +332,7 @@ void onPerfConfig(std::string_view, std::string_view key, std::string_view value
                 g_intervalDisplay = EGL_NO_DISPLAY;
             }
         } else if (key == "fullbright") {
-            g_fullbright.store(std::clamp(std::stof(std::string(value)), 0.0f, 10.0f),
-                               std::memory_order_relaxed);
+            g_fullbright.store(std::stof(std::string(value)), std::memory_order_relaxed);
             syncFullbright();
         }
     } catch (...) {
@@ -391,7 +344,7 @@ void onFastConfig(std::string_view, std::string_view, std::string_view) {}
 void registerMenus() {
     {
         pl::modmenu::ModuleBuilder b("bactro.performance", "Performance");
-        b.description("Unlock FPS (VSync off) + Fullbright 0-10.")
+        b.description("Unlock FPS (VSync off) + Fullbright. Signatures resolved in background.")
             .defaultEnabled(true)
             .onToggle(onPerfToggle)
             .onConfigChanged(onPerfConfig);
@@ -401,7 +354,7 @@ void registerMenus() {
     }
     {
         pl::modmenu::ModuleBuilder b("bactro.fastcontainers", "Fast Containers");
-        b.description("Faster chest/shulker re-open after close (BedrockTools ABIs, async resolve).")
+        b.description("Close a chest/shulker after server opens it, then open the next with no client wait (MP-friendly).")
             .defaultEnabled(true)
             .onToggle(onFastToggle)
             .onConfigChanged(onFastConfig);
@@ -419,15 +372,14 @@ public:
     }
 
     bool load(pl::mod::ModContext&) {
-        LOGI("load %s %s", bactro::Name.data(), bactro::Version.data());
+        LOGI("load %s %s — full BT signature table embedded", bactro::Name.data(), bactro::Version.data());
         return true;
     }
 
     bool enable(pl::mod::ModContext&) {
         registerMenus();
         installSwapHook();
-        resolveFullbrightAsync();
-        if (g_fastContainers.load()) installContainerHooksAsync();
+        resolveEverythingAsync(); // all signatures, once, off main thread
         g_perfEnabled.store(true, std::memory_order_release);
         LOGI("BactroNative enabled");
         return true;
