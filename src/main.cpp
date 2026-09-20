@@ -14,7 +14,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,6 +27,33 @@
 namespace {
 
 using bactro::memory::SignatureId;
+
+// File heartbeat — Termux often cannot read Minecraft logcat on non-root Android.
+// Check with: cat /sdcard/Android/media/org.levimc.launcher/bactro_status.txt
+constexpr const char* kStatusPath =
+    "/storage/emulated/0/Android/media/org.levimc.launcher/bactro_status.txt";
+constexpr const char* kStatusPathAlt =
+    "/sdcard/Android/media/org.levimc.launcher/bactro_status.txt";
+
+void writeStatus(const char* line) {
+    for (const char* path : {kStatusPath, kStatusPathAlt}) {
+        std::ofstream out(path, std::ios::app);
+        if (!out) continue;
+        out << line << '\n';
+        out.close();
+        return;
+    }
+}
+
+void writeStatusReplace(const std::string& body) {
+    for (const char* path : {kStatusPath, kStatusPathAlt}) {
+        std::ofstream out(path, std::ios::trunc);
+        if (!out) continue;
+        out << body;
+        out.close();
+        return;
+    }
+}
 
 // -------- Performance --------
 // IMPORTANT: do NOT hook eglSwapBuffers — that made LeviLauncher's FPS counter show 0.
@@ -275,29 +304,41 @@ void installGameHooksFromResolved() {
         LOGI("hook SurvivalInteract");
     }
     LOGI("Fast Containers hooks: %d/6", n);
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "hooks=%d/6", n);
+    writeStatus(buf);
 }
 
 void resolveEverythingAsync() {
     std::thread([] {
         LOGI("resolveAll starting (background)...");
+        writeStatus("resolveAll starting...");
         const bool ok = bactro::memory::resolveAll("libminecraftpe.so");
         g_sigsReady.store(ok, std::memory_order_release);
         LOGI("resolveAll done ok=%d", ok ? 1 : 0);
+        {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "resolveAll done ok=%d", ok ? 1 : 0);
+            writeStatus(buf);
+        }
 
         const auto fb = bactro::memory::resolve(SignatureId::Fullbright);
         if (fb) {
             g_fullbrightTarget = reinterpret_cast<void*>(fb);
             std::memcpy(g_fullbrightOriginal, g_fullbrightTarget, 12);
             LOGI("Fullbright @ %p", g_fullbrightTarget);
+            writeStatus("fullbright target found");
             syncFullbright();
         } else {
             LOGE("Fullbright missing");
+            writeStatus("fullbright MISSING");
         }
 
         if (g_fastContainers.load(std::memory_order_relaxed))
             installGameHooksFromResolved();
         if (g_perfEnabled.load(std::memory_order_relaxed))
             installTickHook();
+        writeStatus("async init finished");
     }).detach();
 }
 
@@ -380,15 +421,19 @@ public:
 
     bool load(pl::mod::ModContext&) {
         LOGI("load %s %s", bactro::Name.data(), bactro::Version.data());
+        writeStatusReplace(std::string("load ") + std::string(bactro::Name) + " " +
+                           std::string(bactro::Version) + "\n");
         return true;
     }
 
     bool enable(pl::mod::ModContext&) {
         registerMenus();
         installSwapIntervalHook();
+        writeStatus(g_swapIntervalHooked ? "eglSwapInterval OK" : "eglSwapInterval FAIL");
         resolveEverythingAsync();
         g_perfEnabled.store(true, std::memory_order_release);
         LOGI("BactroNative enabled");
+        writeStatus("enabled");
         return true;
     }
 
