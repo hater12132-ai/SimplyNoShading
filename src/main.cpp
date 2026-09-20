@@ -286,6 +286,10 @@ bool tryHook(SignatureId id, void* detour, void** originalOut, const char* name,
 }
 
 void installGameHooksFromResolved() {
+    // 1.26.51.1 crash on load was caused by SurvivalUseItemOn / GameModeInteract /
+    // ContainerClose detours (wrong target or ABI). Only install the proven-safe pair:
+    //   ContainerOpen  (state) + GameModeUseItemOn (firstEvent retries).
+    // Always-retry mode is used so we don't need close tracking.
     int n = 0;
     void* o = nullptr;
 
@@ -295,40 +299,22 @@ void installGameHooksFromResolved() {
         g_containerOpenOrig = reinterpret_cast<ScreenFn>(o);
 
     o = nullptr;
-    if (tryHook(SignatureId::ContainerScreenControllerDtor,
-                reinterpret_cast<void*>(&containerCloseDetour), &o, "ContainerClose", n))
-        g_containerCloseOrig = reinterpret_cast<ScreenFn>(o);
-
-    o = nullptr;
     if (tryHook(SignatureId::GameModeUseItemOn,
                 reinterpret_cast<void*>(&gameModeUseItemOnDetour), &o, "GameModeUseItemOn", n))
         g_useOnGame = reinterpret_cast<UseItemOnFn>(o);
 
-    o = nullptr;
-    if (tryHook(SignatureId::SurvivalModeUseItemOn,
-                reinterpret_cast<void*>(&survivalModeUseItemOnDetour), &o, "SurvivalUseItemOn", n))
-        g_useOnSurvival = reinterpret_cast<UseItemOnFn>(o);
+    // Intentionally NOT hooked (caused load crash on 1.26.51.1):
+    //   ContainerClose, SurvivalUseItemOn, GameModeInteract, SurvivalInteract
+    writeStatus("skip ContainerClose SurvivalUseItemOn GameModeInteract SurvivalInteract (crash-safe)");
 
-    o = nullptr;
-    if (tryHook(SignatureId::GameModeInteract,
-                reinterpret_cast<void*>(&gameModeInteractDetour), &o, "GameModeInteract", n))
-        g_interactGame = reinterpret_cast<InteractFn>(o);
+    // Always allow fast open retries without close tracking
+    g_readyForNextOpen.store(true, std::memory_order_release);
+    g_containerOpen.store(false, std::memory_order_release);
+    writeStatus("always-retry mode ON");
 
-    o = nullptr;
-    if (tryHook(SignatureId::SurvivalModeInteract,
-                reinterpret_cast<void*>(&survivalModeInteractDetour), &o, "SurvivalInteract", n))
-        g_interactSurvival = reinterpret_cast<InteractFn>(o);
-
-    // No open/close tracking → always allow retries (don't gate on container state)
-    if (!g_containerOpenOrig && !g_containerCloseOrig) {
-        g_readyForNextOpen.store(true, std::memory_order_release);
-        g_containerOpen.store(false, std::memory_order_release);
-        writeStatus("note: no open/close hooks — always-retry mode");
-    }
-
-    LOGI("Fast Containers hooks: %d/6", n);
+    LOGI("Fast Containers hooks: %d (safe set)", n);
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "hooks=%d/6", n);
+    std::snprintf(buf, sizeof(buf), "hooks=%d/2-safe", n);
     writeStatus(buf);
 }
 
