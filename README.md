@@ -1,17 +1,20 @@
-# BactroNative 1.0.1
+# BactroNative 1.1.0
 
-## Why 1.0.0 ANR’d
-On enable it ran **several full `libminecraftpe.so` signature scans on the main thread**
-(~1.5s each). That blocked the UI long enough for Android to fire an **ANR**.
-`ContainerOpen` was also hooked with an incorrect ABI.
+## Fast Containers (real)
+Uses **BedrockTools** signatures and calling conventions:
+- `ContainerScreenControllerOpen` / `Dtor` (8-arg ScreenFn)
+- `GameModeUseItemOn` / `SurvivalModeUseItemOn` (`InteractionResultValue(…)`)
+- `GameModeInteract` / `SurvivalModeInteract` (`bool(…)`)
 
-## 1.0.1 (safe)
-- **Performance**: `eglSwapInterval(0)` only — **no** `nanosleep` on present
-- **Fullbright**: resolved **on a background thread**
-- **Fast Containers**: menu stub only (default OFF) until a verified, non-blocking approach exists
+Resolved in **one background batch** (no main-thread multi-scan ANR).
 
-## Modules
-| Module | Default | Notes |
-|--------|---------|--------|
-| Performance | ON | Unlock FPS + Fullbright 0–10 |
-| Fast Containers | OFF | Placeholder — does not hook game code |
+After you close a chest/shulker, the next use/interact is retried once if it fails
+(within 750ms) so you can hop containers faster.
+
+## Performance
+- VSync unlock via `eglSwapInterval(0)`
+- Fullbright 0–10 (async signature resolve)
+
+## Note
+If your build is 1.26.51.x and some signatures miss, logcat will show
+`Fast Containers hooks installed: N/6`. Need matching patterns for that build.
