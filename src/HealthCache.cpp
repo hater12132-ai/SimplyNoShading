@@ -2,6 +2,7 @@
 
 #include <android/log.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -154,20 +155,22 @@ void tryParseOne(const uint8_t* data, size_t size) {
 } // namespace
 
 void onRawGamePacket(const uint8_t* data, size_t size) {
-    if (!data || size == 0) return;
-    // Some peers deliver a length-prefixed batch; try direct first, then scan
-    tryParseOne(data, size);
-
-    // Also scan for embedded packet id 29 varint patterns in larger buffers
-    // (batched payloads sometimes wrap multiple packets)
-    if (size > 16) {
-        for (size_t i = 0; i + 8 < size && i < size - 8; ++i) {
-            // cheap filter: first byte of varint packet header often 0x1d or with flags
-            const uint8_t b = data[i];
-            if ((b & 0x3F) == 29 || b == 29) {
-                tryParseOne(data + i, size - i);
+    // Crash-safe: never throw out of packet path; bound size hard.
+    if (!data || size == 0 || size > (1u << 20)) return;
+    try {
+        tryParseOne(data, size);
+        // Scan for embedded UpdateAttributes (id 29) in batches — capped iterations
+        if (size > 16) {
+            const size_t limit = std::min(size, static_cast<size_t>(4096));
+            for (size_t i = 0; i + 8 < limit; ++i) {
+                const uint8_t b = data[i];
+                if ((b & 0x3F) == 29 || b == 29) {
+                    tryParseOne(data + i, size - i);
+                }
             }
         }
+    } catch (...) {
+        // swallow — never crash the network thread
     }
 }
 

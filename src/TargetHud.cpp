@@ -68,14 +68,20 @@ float g_anim = 0.f;
 bool g_steveReady = false;
 
 // ---- helpers ----
+// NOTE: ActorGetNameTag returns std::string by value — calling a mismatched
+// signature hard-crashes. We never call it from attack detours; name is best-effort
+// only from a null-checked pointer with a try/catch, and we prefer a static label.
 using ActorGetNameTagFn = std::string (*)(void*);
 using ActorIsPlayerFn = bool (*)(void*);
-using AttackFn = bool (*)(void*, void*, bool, const void*);
+using AttackFn = bool (*)(void*, void*, bool);
 
 ActorGetNameTagFn g_getNameTag = nullptr;
 ActorIsPlayerFn g_isPlayer = nullptr;
 AttackFn g_attackOrig = nullptr;
 bool g_attackHooked = false;
+
+// Never touch game memory below this; avoids bad actor* from hit results
+constexpr std::uintptr_t kMinActorPtr = 0x10000;
 
 std::uint32_t withAlpha(std::uint32_t c, float a) {
     a = std::clamp(a, 0.f, 1.f);
@@ -176,36 +182,39 @@ void ensureSteveHead() {
     g_steveReady = true;
 }
 
+bool actorPtrOk(void* actor) {
+    const auto p = reinterpret_cast<std::uintptr_t>(actor);
+    return actor != nullptr && p >= kMinActorPtr && (p & 0x7) == 0;
+}
+
 std::string readName(void* actor) {
-    if (!actor) return "Player";
-    if (g_getNameTag) {
-        try {
-            return cleanName(g_getNameTag(actor));
-        } catch (...) {
-        }
-    }
+    if (!actorPtrOk(actor)) return "Player";
+    // Calling Bedrock std::string-return APIs is fragile across versions.
+    // Keep disabled for crash safety; HUD still shows "Player" + HP estimate.
+    (void)g_getNameTag;
+    (void)actor;
     return "Player";
 }
 
 bool isPlayer(void* actor) {
-    if (!actor) return false;
-    if (g_isPlayer) {
-        try {
-            return g_isPlayer(actor);
-        } catch (...) {
-        }
-    }
-    return true; // assume player if unknown
+    if (!actorPtrOk(actor)) return false;
+    // Skip ActorIsPlayer native call — same ABI risk. Assume player targets.
+    (void)g_isPlayer;
+    return true;
 }
 
 void applyTarget(void* actor, bool fromHit) {
-    if (!actor) return;
-    if (g_playersOnly.load() && !isPlayer(actor)) return;
+    if (!actorPtrOk(actor)) return;
+    // playersOnly still respected conceptually; we cannot safely filter without
+    // ActorIsPlayer, so we accept the pointer when show-on-hit is enabled.
 
     std::lock_guard lock(g_mutex);
     const bool same = g_target.valid && g_target.actor == actor;
     g_target.actor = actor;
-    g_target.name = readName(actor);
+    // Only refresh name on first bind — never call native getNameTag on hit path
+    if (!same || g_target.name.empty()) {
+        g_target.name = "Player";
+    }
     g_target.valid = true;
     g_target.dead = false;
     g_target.lastSeen = std::chrono::steady_clock::now();
@@ -216,7 +225,7 @@ void applyTarget(void* actor, bool fromHit) {
     }
 
     if (!same) {
-        // New target: assume full HP until UpdateAttributesPacket arrives
+        // New target: assume full HP (no packet hook — crash-safe mode)
         g_target.health = 20.f;
         g_target.maxHealth = 20.f;
         g_target.displayHealth = 20.f;
@@ -229,8 +238,12 @@ void applyTarget(void* actor, bool fromHit) {
         g_target.hurtFlash = fromHit ? 1.f : 0.f;
         g_target.hitCount = fromHit ? 1 : 0;
     } else if (fromHit && !g_target.liveHealth) {
-        // Fallback estimate only until real packet HP is bound
+        // Fallback estimate: ~1 heart per hit until packet HP is safe again
         g_target.health = std::max(0.f, g_target.health - 1.f);
+        if (g_target.health <= 0.01f) {
+            g_target.dead = true;
+            g_target.diedAt = g_target.lastSeen;
+        }
     }
 }
 
@@ -285,31 +298,36 @@ void markDead() {
 }
 
 // ---- attack detour ----
-bool attackDetour(void* gm, void* target, bool someFlag, const void* hitResult) {
-    if (g_enabled.load() && g_showOnHit.load() && target) {
-        applyTarget(target, true);
+// GameModeAttack pattern on 1.26.51 is very short and ambiguous; a wrong match
+// crashes the moment you (or the game) calls that site. We do NOT install it.
+// TargetHUD still works via HUD editor preview + estimated HP if bound later.
+bool attackDetour(void* gm, void* target, bool someFlag) {
+    // Extremely defensive: never touch target beyond pointer validity; never
+    // call getNameTag/isPlayer from this path.
+    if (g_enabled.load() && g_showOnHit.load() && actorPtrOk(target)) {
+        try {
+            applyTarget(target, true);
+        } catch (...) {
+        }
     }
-    if (g_attackOrig) return g_attackOrig(gm, target, someFlag, hitResult);
+    if (g_attackOrig) return g_attackOrig(gm, target, someFlag);
     return false;
 }
 
 void tryInstallAttackHook() {
-    if (g_attackHooked) return;
-    void* o = nullptr;
-    if (bactro::memory::hook(SignatureId::GameModeAttack, reinterpret_cast<void*>(&attackDetour), &o)) {
-        g_attackOrig = reinterpret_cast<AttackFn>(o);
-        g_attackHooked = true;
-        TH_LOGI("TargetHUD: GameModeAttack hooked");
-    } else {
-        TH_LOGI("TargetHUD: GameModeAttack not available (look mode / manual still ok)");
-    }
+    // DISABLED for crash safety — short GameModeAttack signature is unsafe.
+    // Re-enable only after a unique, verified prologue pattern for 1.26.51.1.
+    TH_LOGI("TargetHUD: GameModeAttack NOT hooked (crash-safe)");
+    g_attackHooked = false;
+    g_attackOrig = nullptr;
+    (void)attackDetour;
 }
 
 void resolveActorFns() {
-    auto nt = bactro::memory::resolve(SignatureId::ActorGetNameTag);
-    if (nt) g_getNameTag = reinterpret_cast<ActorGetNameTagFn>(nt);
-    auto ip = bactro::memory::resolve(SignatureId::ActorIsPlayer);
-    if (ip) g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(ip);
+    // Do not bind getNameTag / isPlayer — calling them with wrong ABI crashes.
+    g_getNameTag = nullptr;
+    g_isPlayer = nullptr;
+    TH_LOGI("TargetHUD: native name/isPlayer calls disabled (crash-safe)");
 }
 
 // ---- draw (ProtoHax style) ----
@@ -566,7 +584,7 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Target HUD");
-    b.description("Target card: head, name, 20/20 (gold on gapple abs), green→yellow→red bar. Drag in HUD Editor.")
+    b.description("Target card (crash-safe): head, 20/20, green→yellow→red bar. No combat hooks. Drag in HUD Editor.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -590,9 +608,13 @@ void onSignaturesReady() {
 
 void onFrame() {
     if (!g_enabled.load()) return;
-    syncPacketHealth();
-    tickAnim();
-    submitHud();
+    try {
+        syncPacketHealth();
+        tickAnim();
+        submitHud();
+    } catch (...) {
+        // Never let HUD draw take down the game
+    }
 }
 
 void onAttack(void* targetActor) {
