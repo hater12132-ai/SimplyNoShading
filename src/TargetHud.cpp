@@ -282,6 +282,47 @@ void applyTarget(void* actor, bool fromHit) {
     }
 }
 
+// Packet-driven target: someone (not us) just took damage / played the hurt animation.
+void applyRuntimeTarget(uint64_t rid) {
+    if (!g_enabled.load() || !g_showOnHit.load()) return;
+    if (rid == 0 || rid == bactro::health::selfRuntimeId()) return;
+    const std::string raw = bactro::health::playerName(rid);
+    if (raw.empty() && g_playersOnly.load()) return; // not a player we saw spawn (mob / unknown)
+
+    const auto now = std::chrono::steady_clock::now();
+    if (logBudget())
+        logLine("TargetHUD: hurt runtime=%llu name=%.30s -> card", (unsigned long long)rid,
+                raw.empty() ? "?" : raw.c_str());
+    std::lock_guard lock(g_mutex);
+    const bool same = g_target.valid && g_target.runtimeId == rid;
+    g_target.valid = true;
+    g_target.dead = false;
+    g_target.lastSeen = now;
+    g_target.lastHit = now;
+    g_target.hurtFlash = 1.f;
+    if (!same) {
+        g_target.actor = nullptr;
+        g_target.name = raw.empty() ? "Player" : cleanName(raw);
+        g_target.runtimeId = rid;
+        g_target.hasHead = false;
+        g_target.headKey.clear();
+        g_target.hitCount = 1;
+        g_target.absorption = 0.f;
+        g_target.displayAbsorption = 0.f;
+        g_target.liveHealth = false;
+        g_target.health = g_target.displayHealth = 20.f;
+        g_target.maxHealth = 20.f;
+        if (auto h = bactro::health::get(rid)) {
+            g_target.health = g_target.displayHealth = h->current;
+            g_target.maxHealth = h->max > 0.f ? h->max : 20.f;
+            g_target.absorption = h->absorption;
+            g_target.liveHealth = true;
+        }
+    } else {
+        ++g_target.hitCount;
+    }
+}
+
 // Pull ProtoHax-style packet HP into the active target.
 // 1) If we already bound a runtimeId, use HealthCache directly.
 // 2) Else, if we recently hit someone, bind the most recent health update (1v1).
@@ -359,11 +400,11 @@ void tryInstallAttackHooks() {
         SignatureId id;
         void* detour;
     };
-    // Internal first: it has a real, long prologue signature (the other two are tiny stubs).
-    const Entry entries[kAttackSlots] = {
+    // Only the Internal function has a real prologue. GameModeAttack / SurvivalModeAttack are
+    // 12-16 byte tail-call stubs: an inline hook there crashed the game on the first hit
+    // (1.26.51.x), so they are intentionally NOT hooked. Hits come from packets instead.
+    const Entry entries[1] = {
         {2, SignatureId::GameModeAttackInternal, reinterpret_cast<void*>(&attackDetour<2>)},
-        {0, SignatureId::GameModeAttack, reinterpret_cast<void*>(&attackDetour<0>)},
-        {1, SignatureId::SurvivalModeAttack, reinterpret_cast<void*>(&attackDetour<1>)},
     };
     std::uintptr_t hookedAddrs[kAttackSlots] = {};
     int hookedCount = 0;
@@ -397,7 +438,7 @@ void tryInstallAttackHooks() {
                     reinterpret_cast<void*>(addr));
         }
     }
-    logLine("TargetHUD: attack hooks active=%d/3", okCount);
+    logLine("TargetHUD: native attack hook active=%d/1 (packet hit detection is always on)", okCount);
 }
 
 void resolveActorFns() {
@@ -697,6 +738,7 @@ void onFrame() {
         s_first = false;
         logLine("TargetHUD: onFrame running (NormalTick alive)");
     }
+    for (uint64_t rid; bactro::health::popHurt(rid);) applyRuntimeTarget(rid);
     syncPacketHealth();
     tickAnim();
     submitHud();

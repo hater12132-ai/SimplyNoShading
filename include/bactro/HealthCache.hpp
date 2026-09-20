@@ -24,4 +24,12 @@ std::optional<EntityHealth> get(uint64_t runtimeId);
 std::optional<std::pair<uint64_t, EntityHealth>> lastUpdate();
 void clear();
 
+// Packet-derived world knowledge (no native game calls needed):
+//  - StartGame(11)  -> own runtime id
+//  - AddPlayer(12)  -> runtimeId -> username
+//  - ActorEvent(27) hurt / UpdateAttributes health drop -> "hurt" queue
+std::string playerName(uint64_t runtimeId);   // "" if unknown (not a player we saw spawn)
+uint64_t selfRuntimeId();                     // 0 if unknown
+bool popHurt(uint64_t& runtimeId);            // FIFO of entities that just took damage
+
 } // namespace bactro::health

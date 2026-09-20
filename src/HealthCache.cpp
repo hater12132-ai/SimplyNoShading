@@ -1,7 +1,9 @@
 #include "bactro/HealthCache.hpp"
+#include "bactro/Status.hpp"
 
 #include <android/log.h>
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -17,6 +19,24 @@ std::unordered_map<uint64_t, EntityHealth> g_map;
 uint64_t g_lastRuntimeId = 0;
 EntityHealth g_lastHealth{};
 bool g_hasLast = false;
+std::unordered_map<uint64_t, std::string> g_names;
+uint64_t g_self = 0;
+std::vector<uint64_t> g_hurt;
+int g_seenMask = 0; // which packet ids we already logged once
+
+void logOnce(int bit, const char* what) {
+    {
+        std::lock_guard lock(g_mu);
+        if (g_seenMask & (1 << bit)) return;
+        g_seenMask |= (1 << bit);
+    }
+    bactro::statusLine(what);
+}
+
+void pushHurt(uint64_t id) {
+    std::lock_guard lock(g_mu);
+    if (g_hurt.size() < 32) g_hurt.push_back(id);
+}
 
 // ---- Bedrock binary readers (little-endian + unsigned varints) ----
 struct Reader {
@@ -125,11 +145,16 @@ void parseUpdateAttributesPayload(Reader& r) {
     if (healthCur < 0.f && absorp < 0.f) return;
 
     EntityHealth h{};
+    bool hadPrev = false;
     {
         std::lock_guard lock(g_mu);
         auto it = g_map.find(runtimeId);
-        if (it != g_map.end()) h = it->second;
+        if (it != g_map.end()) {
+            h = it->second;
+            hadPrev = h.valid;
+        }
     }
+    if (hadPrev && healthCur >= 0.f && healthCur < h.current - 0.01f) pushHurt(runtimeId);
     if (healthCur >= 0.f) {
         h.current = healthCur;
         if (healthMax > 0.f) h.max = healthMax;
@@ -139,34 +164,101 @@ void parseUpdateAttributesPayload(Reader& r) {
     setHealth(runtimeId, h.current, h.max, h.absorption);
 }
 
-// Batch / single packet: may be one game packet or a batch of them
+void parseStartGame(Reader& r) {
+    uint64_t uniqueId = 0, runtimeId = 0; // unique id is zigzag varint64 (same byte layout)
+    if (!r.readVarU64(uniqueId) || !r.readVarU64(runtimeId)) return;
+    {
+        std::lock_guard lock(g_mu);
+        g_self = runtimeId;
+    }
+    char b[80];
+    std::snprintf(b, sizeof(b), "pkt StartGame selfRuntimeId=%llu", (unsigned long long)runtimeId);
+    bactro::statusLine(b);
+}
+
+void parseAddPlayer(Reader& r) {
+    if (r.left() < 16) return;
+    r.p += 16; // uuid
+    std::string name;
+    uint64_t runtimeId = 0;
+    if (!r.readString(name) || !r.readVarU64(runtimeId)) return;
+    {
+        std::lock_guard lock(g_mu);
+        g_names[runtimeId] = name;
+    }
+    char b[160];
+    std::snprintf(b, sizeof(b), "pkt AddPlayer runtime=%llu name=%.40s", (unsigned long long)runtimeId,
+                  name.c_str());
+    logOnce(2, b);
+}
+
+void parseActorEvent(Reader& r) {
+    uint64_t runtimeId = 0;
+    uint8_t ev = 0;
+    if (!r.readVarU64(runtimeId) || !r.readU8(ev)) return;
+    if (ev == 2) { // HURT_ANIMATION
+        pushHurt(runtimeId);
+        logOnce(3, "pkt ActorEvent hurt seen");
+    }
+}
+
+void dispatchPacket(const uint8_t* d, size_t n) {
+    if (!d || n < 1) return;
+    Reader r{d, d + n};
+    uint32_t id = 0;
+    if (!readHeader(r, id)) return;
+    switch (id) {
+    case 11: parseStartGame(r); break;
+    case 12: parseAddPlayer(r); break;
+    case 27: parseActorEvent(r); break;
+    case 29:
+        logOnce(4, "pkt UpdateAttributes seen");
+        parseUpdateAttributesPayload(r);
+        break;
+    default: break;
+    }
+}
+
+// Preferred: buffer is a batch [varuint len][packet]... that partitions exactly.
+bool parseBatch(const uint8_t* data, size_t size) {
+    if (!data || size < 2 || size > 1 << 22) return false;
+    struct Span { const uint8_t* p; size_t n; };
+    std::vector<Span> pk;
+    Reader r{data, data + size};
+    while (r.ok()) {
+        uint32_t len = 0;
+        if (!r.readVarU32(len)) return false;
+        if (len == 0 || len > r.left()) return false;
+        if (pk.size() >= 512) return false;
+        pk.push_back({r.p, len});
+        r.p += len;
+    }
+    if (pk.empty()) return false;
+    for (const auto& s : pk) dispatchPacket(s.p, s.n);
+    logOnce(0, "net: buffers parse as length-prefixed batches");
+    return true;
+}
+
+// Fallback (old behaviour): buffer is one bare packet, or unknown framing (id 29 only).
 void tryParseOne(const uint8_t* data, size_t size) {
     if (!data || size < 2 || size > 1 << 20) return;
     Reader r{data, data + size};
     uint32_t packetId = 0;
     if (!readHeader(r, packetId)) return;
-    // UpdateAttributesPacket = 29 (0x1D)
-    if (packetId == 29) {
-        parseUpdateAttributesPayload(r);
-    }
+    if (packetId == 29) parseUpdateAttributesPayload(r);
 }
 
 } // namespace
 
 void onRawGamePacket(const uint8_t* data, size_t size) {
     if (!data || size == 0) return;
-    // Some peers deliver a length-prefixed batch; try direct first, then scan
+    if (parseBatch(data, size)) return;
+    logOnce(1, "net: buffer is NOT a clean batch (fallback scan for id 29 only)");
     tryParseOne(data, size);
-
-    // Also scan for embedded packet id 29 varint patterns in larger buffers
-    // (batched payloads sometimes wrap multiple packets)
     if (size > 16) {
         for (size_t i = 0; i + 8 < size && i < size - 8; ++i) {
-            // cheap filter: first byte of varint packet header often 0x1d or with flags
             const uint8_t b = data[i];
-            if ((b & 0x3F) == 29 || b == 29) {
-                tryParseOne(data + i, size - i);
-            }
+            if ((b & 0x3F) == 29 || b == 29) tryParseOne(data + i, size - i);
         }
     }
 }
@@ -203,7 +295,28 @@ std::optional<std::pair<uint64_t, EntityHealth>> lastUpdate() {
 void clear() {
     std::lock_guard lock(g_mu);
     g_map.clear();
+    g_names.clear();
+    g_hurt.clear();
     g_hasLast = false;
+}
+
+std::string playerName(uint64_t runtimeId) {
+    std::lock_guard lock(g_mu);
+    auto it = g_names.find(runtimeId);
+    return it == g_names.end() ? std::string() : it->second;
+}
+
+uint64_t selfRuntimeId() {
+    std::lock_guard lock(g_mu);
+    return g_self;
+}
+
+bool popHurt(uint64_t& runtimeId) {
+    std::lock_guard lock(g_mu);
+    if (g_hurt.empty()) return false;
+    runtimeId = g_hurt.front();
+    g_hurt.erase(g_hurt.begin());
+    return true;
 }
 
 } // namespace bactro::health
