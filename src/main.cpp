@@ -1,4 +1,6 @@
 #include "bactro/Signatures.hpp"
+#include "bactro/TargetHud.hpp"
+#include "bactro/HealthCache.hpp"
 #include "Version.hpp"
 
 #include <pl/Mod.hpp>
@@ -163,6 +165,7 @@ void normalTickDetour(void* self) {
             else eglSwapInterval(d, 0);
         }
     }
+    bactro::targethud::onFrame();
 }
 
 bool installSwapIntervalHook() {
@@ -201,6 +204,39 @@ bool installTickHook() {
     g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
     g_tickHooked = true;
     LOGI("NormalTick hooked");
+    return true;
+}
+
+// ---- NetworkPeerReceive (CompressedNetworkPeer @ 0xc6cf920 on 1.26.51.1) ----
+// ProtoHax-style: feed raw game packets into HealthCache so UpdateAttributes (id 29)
+// drives TargetHUD HP. Signature verified unique in libminecraftpe.so 1.26.51.1.
+using NetworkPeerReceiveFn = int (*)(void* self, std::string& data, int a2, int a3);
+NetworkPeerReceiveFn g_netRecvOriginal = nullptr;
+bool g_netRecvHooked = false;
+
+int networkPeerReceiveDetour(void* self, std::string& data, int a2, int a3) {
+    const int status = g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 0;
+    // DataStatus::Ok is typically 0; still try parse whenever buffer has content
+    if (!data.empty()) {
+        bactro::health::onRawGamePacket(
+            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    }
+    return status;
+}
+
+bool installNetworkPeerReceiveHook() {
+    if (g_netRecvHooked) return true;
+    void* o = nullptr;
+    if (!bactro::memory::hook(SignatureId::NetworkPeerReceive,
+                              reinterpret_cast<void*>(&networkPeerReceiveDetour), &o)) {
+        LOGE("NetworkPeerReceive hook failed");
+        writeStatus("NetworkPeerReceive HOOK FAIL");
+        return false;
+    }
+    g_netRecvOriginal = reinterpret_cast<NetworkPeerReceiveFn>(o);
+    g_netRecvHooked = true;
+    LOGI("NetworkPeerReceive hooked (CompressedNetworkPeer)");
+    writeStatus("NetworkPeerReceive OK");
     return true;
 }
 
@@ -343,10 +379,23 @@ void resolveEverythingAsync() {
             writeStatus("fullbright MISSING");
         }
 
+        {
+            const auto nr = bactro::memory::resolve(SignatureId::NetworkPeerReceive);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "NetworkPeerReceive @ %p", reinterpret_cast<void*>(nr));
+            LOGI("%s", buf);
+            writeStatus(buf);
+        }
+
         if (g_fastContainers.load(std::memory_order_relaxed))
             installGameHooksFromResolved();
         if (g_perfEnabled.load(std::memory_order_relaxed))
             installTickHook();
+        // TargetHUD needs NormalTick for draw; ensure tick hook even if perf off
+        installTickHook();
+        // Packet HP for TargetHUD (UpdateAttributes via CompressedNetworkPeer)
+        installNetworkPeerReceiveHook();
+        bactro::targethud::onSignaturesReady();
         writeStatus("async init finished");
     }).detach();
 }
@@ -417,6 +466,7 @@ void registerMenus() {
             .onConfigChanged(onFastConfig);
         b.registerModule();
     }
+    bactro::targethud::registerModule();
 }
 
 } // namespace

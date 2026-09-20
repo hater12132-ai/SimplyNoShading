@@ -64,6 +64,7 @@ enum class SignatureId : std::uint16_t {
     SurvivalModeAttack,
     GameModeAttack,
     GameModeAttackInternal,
+    NetworkPeerReceive,
     LevelGetHitResult,
     BlockSourceGetBiome,
     BlockSourceGetBlock,
