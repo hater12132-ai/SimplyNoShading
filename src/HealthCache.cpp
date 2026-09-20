@@ -3,7 +3,9 @@
 
 #include <android/log.h>
 
+#include <atomic>
 #include <cstdio>
+#include <bitset>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -207,6 +209,24 @@ void dispatchPacket(const uint8_t* d, size_t n) {
     Reader r{d, d + n};
     uint32_t id = 0;
     if (!readHeader(r, id)) return;
+    {
+        static std::bitset<1024> seen;
+        static int distinct = 0;
+        bool fresh = false;
+        {
+            std::lock_guard lock(g_mu);
+            if (!seen.test(id) && distinct < 60) {
+                seen.set(id);
+                ++distinct;
+                fresh = true;
+            }
+        }
+        if (fresh) {
+            char b[96];
+            std::snprintf(b, sizeof(b), "net: new packet id=%u len=%zu", id, n);
+            bactro::statusLine(b);
+        }
+    }
     switch (id) {
     case 11: parseStartGame(r); break;
     case 12: parseAddPlayer(r); break;
@@ -252,6 +272,17 @@ void tryParseOne(const uint8_t* data, size_t size) {
 
 void onRawGamePacket(const uint8_t* data, size_t size) {
     if (!data || size == 0) return;
+    {
+        static std::atomic<int> dumps{0};
+        const int k = dumps.fetch_add(1);
+        if (k < 5 || (k == 200) || (k == 2000)) {
+            char b[200];
+            int o = std::snprintf(b, sizeof(b), "net: buf#%d size=%zu:", k, size);
+            for (size_t i = 0; i < size && i < 16 && o < (int)sizeof(b) - 4; ++i)
+                o += std::snprintf(b + o, sizeof(b) - o, " %02x", data[i]);
+            bactro::statusLine(b);
+        }
+    }
     if (parseBatch(data, size)) return;
     logOnce(1, "net: buffer is NOT a clean batch (fallback scan for id 29 only)");
     tryParseOne(data, size);
