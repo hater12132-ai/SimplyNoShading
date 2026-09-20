@@ -211,16 +211,41 @@ bool installTickHook() {
 }
 
 // ---- NetworkPeerReceive (CompressedNetworkPeer @ 0xc6cf920 on 1.26.51.1) ----
-// ProtoHax-style: feed raw game packets into HealthCache so UpdateAttributes (id 29)
-// drives TargetHUD HP. Signature verified unique in libminecraftpe.so 1.26.51.1.
+// IMPORTANT: only parse when DataStatus indicates real data.
+// Bedrock DataStatus is typically: 0 = Ok/HasData, 1 = NoData, 2 = BrokenData.
+// Parsing on every non-empty std::string was wrong: on NoData the string can keep
+// leftover bytes (often last *outbound* packet), which produced client→server IDs
+// (30/33/36) and never UpdateAttributes (29).
 using NetworkPeerReceiveFn = int (*)(void* self, std::string& data, int a2, int a3);
 NetworkPeerReceiveFn g_netRecvOriginal = nullptr;
 bool g_netRecvHooked = false;
 
 int networkPeerReceiveDetour(void* self, std::string& data, int a2, int a3) {
-    const int status = g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 0;
-    // DataStatus::Ok is typically 0; still try parse whenever buffer has content
-    if (!data.empty()) {
+    const int status = g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 1;
+
+    // Status histogram (first few distinct values) for diagnosis
+    {
+        static int s_statusLog = 0;
+        static int s_seen[8] = {};
+        if (status >= 0 && status < 8) s_seen[status]++;
+        if (s_statusLog < 12) {
+            char b[96];
+            std::snprintf(b, sizeof(b), "net: status=%d size=%zu (HasData only if status==0)",
+                          status, data.size());
+            writeStatus(b);
+            ++s_statusLog;
+        } else if (s_statusLog == 12) {
+            char b[128];
+            std::snprintf(b, sizeof(b),
+                          "net: status hist 0=%d 1=%d 2=%d 3=%d 4=%d (parse only status==0)",
+                          s_seen[0], s_seen[1], s_seen[2], s_seen[3], s_seen[4]);
+            writeStatus(b);
+            ++s_statusLog;
+        }
+    }
+
+    // Only feed the parser when the peer reports HasData/Ok.
+    if (status == 0 && !data.empty() && data.size() < (1u << 22)) {
         bactro::health::onRawGamePacket(
             reinterpret_cast<const uint8_t*>(data.data()), data.size());
     }
@@ -238,8 +263,8 @@ bool installNetworkPeerReceiveHook() {
     }
     g_netRecvOriginal = reinterpret_cast<NetworkPeerReceiveFn>(o);
     g_netRecvHooked = true;
-    LOGI("NetworkPeerReceive hooked (CompressedNetworkPeer)");
-    writeStatus("NetworkPeerReceive OK");
+    LOGI("NetworkPeerReceive hooked (CompressedNetworkPeer) status==0 only");
+    writeStatus("NetworkPeerReceive OK (parse only DataStatus==0)");
     return true;
 }
 

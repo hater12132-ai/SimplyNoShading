@@ -228,14 +228,30 @@ void dispatchPacket(const uint8_t* d, size_t n) {
         }
     }
     switch (id) {
-    case 11: parseStartGame(r); break;
-    case 12: parseAddPlayer(r); break;
-    case 27: parseActorEvent(r); break;
+    case 11:
+        logOnce(2, "pkt StartGame seen (server→client path OK)");
+        parseStartGame(r);
+        break;
+    case 12:
+        logOnce(5, "pkt AddPlayer seen");
+        parseAddPlayer(r);
+        break;
+    case 27:
+        parseActorEvent(r);
+        break;
     case 29:
         logOnce(4, "pkt UpdateAttributes seen");
         parseUpdateAttributesPayload(r);
         break;
-    default: break;
+    // Common primarily-client→server IDs. If these dominate with no 11/12/29,
+    // the hooked function is almost certainly SEND, not receive.
+    case 30:
+    case 33:
+    case 36:
+        logOnce(6, "pkt id 30/33/36 (client→server style) — if ONLY these, hook is SEND");
+        break;
+    default:
+        break;
     }
 }
 
