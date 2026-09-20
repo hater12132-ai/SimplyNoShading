@@ -69,7 +69,9 @@ const std::array<SignatureDefinition, SignatureCount> definitions{{
     SignatureDefinition{SignatureId::GameModeInteract, "FD 7B BA A9 FC 0B 00 F9 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FD 03 00 91 FF 03 11 D1 57 D0 3B D5 F3 03 00 AA"},
     SignatureDefinition{SignatureId::SurvivalModeAttack, "? ? ? 39 E3 03 02 AA ? ? ? 34 ? ? ? 90"},
     SignatureDefinition{SignatureId::GameModeAttack, "E3 03 02 AA ? ? ? 52 ? ? ? 14"},
-    SignatureDefinition{SignatureId::GameModeAttackInternal, "? ? ? D1 ? ? ? A9 ? ? ? F9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 59 D0 3B D5 F3 03 00 AA F4 03 03 AA ? ? ? F9 F5 03 02 2A F6 03 01 AA ? ? ? F8 ? ? ? F9 ? ? ? 97"},
+    // 1.26.51.1: SUB SP; MRS; mov x19,x0; mov x20,x3 (no long STP chain). ~5 GameMode variants.
+    SignatureDefinition{SignatureId::GameModeAttackInternal,
+                        "? ? ? D1 59 D0 3B D5 F3 03 00 AA F4 03 03 AA 28 17 40 F9 A8 83 1F F8"},
 
     // CompressedNetworkPeer::receivePacket unique on 1.26.51.1 @ 0xc6cf920
     SignatureDefinition{SignatureId::NetworkPeerReceive,

@@ -211,41 +211,30 @@ bool installTickHook() {
 }
 
 // ---- NetworkPeerReceive (CompressedNetworkPeer @ 0xc6cf920 on 1.26.51.1) ----
-// IMPORTANT: only parse when DataStatus indicates real data.
-// Bedrock DataStatus is typically: 0 = Ok/HasData, 1 = NoData, 2 = BrokenData.
-// Parsing on every non-empty std::string was wrong: on NoData the string can keep
-// leftover bytes (often last *outbound* packet), which produced client→server IDs
-// (30/33/36) and never UpdateAttributes (29).
-using NetworkPeerReceiveFn = int (*)(void* self, std::string& data, int a2, int a3);
+// 1.3.7 proved status==0 NEVER fires; many returns are garbage (-482394104) → wrong
+// ABI assumption on the return value. The std::string& still gets filled, so we parse
+// whenever the buffer is non-empty. TargetHUD also has a native attack hook as the
+// primary "show card on hit" path; packets improve HP when id 29 is present.
+using NetworkPeerReceiveFn = std::uintptr_t (*)(void* self, std::string& data, int a2, int a3);
 NetworkPeerReceiveFn g_netRecvOriginal = nullptr;
 bool g_netRecvHooked = false;
 
-int networkPeerReceiveDetour(void* self, std::string& data, int a2, int a3) {
-    const int status = g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 1;
+std::uintptr_t networkPeerReceiveDetour(void* self, std::string& data, int a2, int a3) {
+    const std::uintptr_t status =
+        g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 0;
 
-    // Status histogram (first few distinct values) for diagnosis
     {
-        static int s_statusLog = 0;
-        static int s_seen[8] = {};
-        if (status >= 0 && status < 8) s_seen[status]++;
-        if (s_statusLog < 12) {
-            char b[96];
-            std::snprintf(b, sizeof(b), "net: status=%d size=%zu (HasData only if status==0)",
-                          status, data.size());
+        static int s_log = 0;
+        if (s_log < 8) {
+            char b[120];
+            std::snprintf(b, sizeof(b), "net: ret=%ld size=%zu", (long)status, data.size());
             writeStatus(b);
-            ++s_statusLog;
-        } else if (s_statusLog == 12) {
-            char b[128];
-            std::snprintf(b, sizeof(b),
-                          "net: status hist 0=%d 1=%d 2=%d 3=%d 4=%d (parse only status==0)",
-                          s_seen[0], s_seen[1], s_seen[2], s_seen[3], s_seen[4]);
-            writeStatus(b);
-            ++s_statusLog;
+            ++s_log;
         }
     }
 
-    // Only feed the parser when the peer reports HasData/Ok.
-    if (status == 0 && !data.empty() && data.size() < (1u << 22)) {
+    // Parse any non-empty buffer. HealthCache only acts on known packet ids (11/12/27/29).
+    if (!data.empty() && data.size() < (1u << 22)) {
         bactro::health::onRawGamePacket(
             reinterpret_cast<const uint8_t*>(data.data()), data.size());
     }
@@ -263,8 +252,8 @@ bool installNetworkPeerReceiveHook() {
     }
     g_netRecvOriginal = reinterpret_cast<NetworkPeerReceiveFn>(o);
     g_netRecvHooked = true;
-    LOGI("NetworkPeerReceive hooked (CompressedNetworkPeer) status==0 only");
-    writeStatus("NetworkPeerReceive OK (parse only DataStatus==0)");
+    LOGI("NetworkPeerReceive hooked (parse non-empty buffers)");
+    writeStatus("NetworkPeerReceive OK (parse non-empty)");
     return true;
 }
 

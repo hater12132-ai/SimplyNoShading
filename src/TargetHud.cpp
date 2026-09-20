@@ -242,10 +242,12 @@ void applyTarget(void* actor, bool fromHit) {
         }
     }
 
-    if (g_playersOnly.load()) {
+    // isPlayer native can be wrong-ABI on some builds and reject every hit.
+    // On a real attack we still show the card; filter only for look-mode binds.
+    if (g_playersOnly.load() && !fromHit) {
         const bool player = isPlayer(actor);
         if (!player) {
-            if (logBudget()) logLine("TargetHUD: hit %p ignored (isPlayer=false, playersOnly on)", actor);
+            if (logBudget()) logLine("TargetHUD: look %p ignored (isPlayer=false, playersOnly on)", actor);
             return;
         }
     }
