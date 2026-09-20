@@ -1,6 +1,7 @@
 #include "bactro/Signatures.hpp"
 #include "bactro/TargetHud.hpp"
 #include "bactro/HealthCache.hpp"
+#include "bactro/Status.hpp"
 #include "Version.hpp"
 
 #include <pl/Mod.hpp>
@@ -199,23 +200,47 @@ bool installTickHook() {
     void* o = nullptr;
     if (!bactro::memory::hook(SignatureId::NormalTick, reinterpret_cast<void*>(&normalTickDetour), &o)) {
         LOGE("NormalTick hook failed (optional)");
+        writeStatus("NormalTick hook FAIL (TargetHUD cannot draw without it)");
         return false;
     }
     g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
     g_tickHooked = true;
     LOGI("NormalTick hooked");
+    writeStatus("NormalTick hooked");
     return true;
 }
 
-// ---- NetworkPeerReceive ----
-// DISABLED (crash-safe): wrong ARM64 ABI for CompressedNetworkPeer::receivePacket
-// caused instant crashes when combat packets arrived (friend hits you / death attributes).
-// Keep the signature resolved for future work; do NOT install a detour until the
-// exact prototype (std::string vs buffer struct, arity) is confirmed in-game.
+// ---- NetworkPeerReceive (CompressedNetworkPeer @ 0xc6cf920 on 1.26.51.1) ----
+// ProtoHax-style: feed raw game packets into HealthCache so UpdateAttributes (id 29)
+// drives TargetHUD HP. Signature verified unique in libminecraftpe.so 1.26.51.1.
+using NetworkPeerReceiveFn = int (*)(void* self, std::string& data, int a2, int a3);
+NetworkPeerReceiveFn g_netRecvOriginal = nullptr;
+bool g_netRecvHooked = false;
+
+int networkPeerReceiveDetour(void* self, std::string& data, int a2, int a3) {
+    const int status = g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 0;
+    // DataStatus::Ok is typically 0; still try parse whenever buffer has content
+    if (!data.empty()) {
+        bactro::health::onRawGamePacket(
+            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    }
+    return status;
+}
+
 bool installNetworkPeerReceiveHook() {
-    writeStatus("NetworkPeerReceive SKIP (crash-safe, no hook)");
-    LOGI("NetworkPeerReceive not hooked (stability)");
-    return false;
+    if (g_netRecvHooked) return true;
+    void* o = nullptr;
+    if (!bactro::memory::hook(SignatureId::NetworkPeerReceive,
+                              reinterpret_cast<void*>(&networkPeerReceiveDetour), &o)) {
+        LOGE("NetworkPeerReceive hook failed");
+        writeStatus("NetworkPeerReceive HOOK FAIL");
+        return false;
+    }
+    g_netRecvOriginal = reinterpret_cast<NetworkPeerReceiveFn>(o);
+    g_netRecvHooked = true;
+    LOGI("NetworkPeerReceive hooked (CompressedNetworkPeer)");
+    writeStatus("NetworkPeerReceive OK");
+    return true;
 }
 
 // ---- Fast Containers ----
@@ -371,10 +396,10 @@ void resolveEverythingAsync() {
             installTickHook();
         // TargetHUD needs NormalTick for draw; ensure tick hook even if perf off
         installTickHook();
-        // Intentionally NOT hooking NetworkPeerReceive — wrong ABI = combat crash
-        installNetworkPeerReceiveHook(); // logs SKIP only
+        // Packet HP for TargetHUD (UpdateAttributes via CompressedNetworkPeer)
+        installNetworkPeerReceiveHook();
         bactro::targethud::onSignaturesReady();
-        writeStatus("async init finished (combat-safe hooks)");
+        writeStatus("async init finished");
     }).detach();
 }
 
@@ -448,6 +473,10 @@ void registerMenus() {
 }
 
 } // namespace
+
+namespace bactro {
+void statusLine(const char* line) { writeStatus(line); }
+} // namespace bactro
 
 class BactroNativeMod {
 public:

@@ -4,6 +4,8 @@
 
 #include <pl/ModMenu.hpp>
 
+#include "bactro/Status.hpp"
+
 #include <android/log.h>
 
 #include <algorithm>
@@ -11,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -68,20 +71,41 @@ float g_anim = 0.f;
 bool g_steveReady = false;
 
 // ---- helpers ----
-// NOTE: ActorGetNameTag returns std::string by value — calling a mismatched
-// signature hard-crashes. We never call it from attack detours; name is best-effort
-// only from a null-checked pointer with a try/catch, and we prefer a static label.
 using ActorGetNameTagFn = std::string (*)(void*);
 using ActorIsPlayerFn = bool (*)(void*);
-using AttackFn = bool (*)(void*, void*, bool);
+// ABI-agnostic attack entry: forward x0..x3 untouched. The three attack entry points do not
+// share one signature (the GameMode::attack thunk takes (gm, actor, x); the internal one takes
+// (gm, actor, flag, ptr)), so typing the 3rd arg as `bool` would truncate a pointer.
+using RawAttackFn = std::uintptr_t (*)(void*, void*, void*, void*);
 
 ActorGetNameTagFn g_getNameTag = nullptr;
 ActorIsPlayerFn g_isPlayer = nullptr;
-AttackFn g_attackOrig = nullptr;
-bool g_attackHooked = false;
 
-// Never touch game memory below this; avoids bad actor* from hit results
-constexpr std::uintptr_t kMinActorPtr = 0x10000;
+constexpr int kAttackSlots = 3; // 0 = GameModeAttack, 1 = SurvivalModeAttack, 2 = GameModeAttackInternal
+constexpr const char* kAttackNames[kAttackSlots] = {"GameModeAttack", "SurvivalModeAttack",
+                                                    "GameModeAttackInternal"};
+RawAttackFn g_attackOrig[kAttackSlots] = {};
+bool g_attackHooked[kAttackSlots] = {};
+
+// Status-file logging (Termux/non-root can't read logcat). Rate limited for per-hit events.
+void logLine(const char* fmt, ...) {
+    char buf[224];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    TH_LOGI("%s", buf);
+    bactro::statusLine(buf);
+}
+bool logBudget() {
+    static std::atomic<int> n{0};
+    return n.fetch_add(1) < 40;
+}
+
+bool plausiblePtr(void* p) {
+    const auto v = reinterpret_cast<std::uintptr_t>(p);
+    return v > 0x10000u && v < 0x0001000000000000ull && (v & 7u) == 0;
+}
 
 std::uint32_t withAlpha(std::uint32_t c, float a) {
     a = std::clamp(a, 0.f, 1.f);
@@ -182,39 +206,54 @@ void ensureSteveHead() {
     g_steveReady = true;
 }
 
-bool actorPtrOk(void* actor) {
-    const auto p = reinterpret_cast<std::uintptr_t>(actor);
-    return actor != nullptr && p >= kMinActorPtr && (p & 0x7) == 0;
-}
-
 std::string readName(void* actor) {
-    if (!actorPtrOk(actor)) return "Player";
-    // Calling Bedrock std::string-return APIs is fragile across versions.
-    // Keep disabled for crash safety; HUD still shows "Player" + HP estimate.
-    (void)g_getNameTag;
-    (void)actor;
+    if (!actor) return "Player";
+    if (g_getNameTag) {
+        try {
+            return cleanName(g_getNameTag(actor));
+        } catch (...) {
+        }
+    }
     return "Player";
 }
 
 bool isPlayer(void* actor) {
-    if (!actorPtrOk(actor)) return false;
-    // Skip ActorIsPlayer native call — same ABI risk. Assume player targets.
-    (void)g_isPlayer;
-    return true;
+    if (!actor) return false;
+    if (g_isPlayer) {
+        try {
+            return g_isPlayer(actor);
+        } catch (...) {
+        }
+    }
+    return true; // assume player if unknown
 }
 
 void applyTarget(void* actor, bool fromHit) {
-    if (!actorPtrOk(actor)) return;
-    // playersOnly still respected conceptually; we cannot safely filter without
-    // ActorIsPlayer, so we accept the pointer when show-on-hit is enabled.
+    if (!actor) return;
+
+    // Several attack entry points can fire for one swing (thunk -> internal). Count it once.
+    if (fromHit) {
+        std::lock_guard lock(g_mutex);
+        if (g_target.valid && g_target.actor == actor &&
+            g_target.lastHit.time_since_epoch().count() != 0 &&
+            std::chrono::duration<float>(std::chrono::steady_clock::now() - g_target.lastHit).count() < 0.05f) {
+            g_target.lastSeen = std::chrono::steady_clock::now();
+            return;
+        }
+    }
+
+    if (g_playersOnly.load()) {
+        const bool player = isPlayer(actor);
+        if (!player) {
+            if (logBudget()) logLine("TargetHUD: hit %p ignored (isPlayer=false, playersOnly on)", actor);
+            return;
+        }
+    }
 
     std::lock_guard lock(g_mutex);
     const bool same = g_target.valid && g_target.actor == actor;
     g_target.actor = actor;
-    // Only refresh name on first bind — never call native getNameTag on hit path
-    if (!same || g_target.name.empty()) {
-        g_target.name = "Player";
-    }
+    g_target.name = readName(actor);
     g_target.valid = true;
     g_target.dead = false;
     g_target.lastSeen = std::chrono::steady_clock::now();
@@ -225,7 +264,7 @@ void applyTarget(void* actor, bool fromHit) {
     }
 
     if (!same) {
-        // New target: assume full HP (no packet hook — crash-safe mode)
+        // New target: assume full HP until UpdateAttributesPacket arrives
         g_target.health = 20.f;
         g_target.maxHealth = 20.f;
         g_target.displayHealth = 20.f;
@@ -238,12 +277,8 @@ void applyTarget(void* actor, bool fromHit) {
         g_target.hurtFlash = fromHit ? 1.f : 0.f;
         g_target.hitCount = fromHit ? 1 : 0;
     } else if (fromHit && !g_target.liveHealth) {
-        // Fallback estimate: ~1 heart per hit until packet HP is safe again
+        // Fallback estimate only until real packet HP is bound
         g_target.health = std::max(0.f, g_target.health - 1.f);
-        if (g_target.health <= 0.01f) {
-            g_target.dead = true;
-            g_target.diedAt = g_target.lastSeen;
-        }
     }
 }
 
@@ -297,37 +332,79 @@ void markDead() {
     g_target.diedAt = std::chrono::steady_clock::now();
 }
 
-// ---- attack detour ----
-// GameModeAttack pattern on 1.26.51 is very short and ambiguous; a wrong match
-// crashes the moment you (or the game) calls that site. We do NOT install it.
-// TargetHUD still works via HUD editor preview + estimated HP if bound later.
-bool attackDetour(void* gm, void* target, bool someFlag) {
-    // Extremely defensive: never touch target beyond pointer validity; never
-    // call getNameTag/isPlayer from this path.
-    if (g_enabled.load() && g_showOnHit.load() && actorPtrOk(target)) {
-        try {
-            applyTarget(target, true);
-        } catch (...) {
-        }
+// ---- attack detours ----
+void noteAttack(void* target, int slot) {
+    if (!g_enabled.load() || !g_showOnHit.load()) return;
+    if (!plausiblePtr(target)) {
+        if (logBudget()) logLine("TargetHUD: %s fired with implausible target %p (wrong hook site?)",
+                                 kAttackNames[slot], target);
+        return;
     }
-    if (g_attackOrig) return g_attackOrig(gm, target, someFlag);
-    return false;
+    if (logBudget()) logLine("TargetHUD: attack via %s target=%p", kAttackNames[slot], target);
+    try {
+        applyTarget(target, true);
+    } catch (...) {
+    }
 }
 
-void tryInstallAttackHook() {
-    // DISABLED for crash safety — short GameModeAttack signature is unsafe.
-    // Re-enable only after a unique, verified prologue pattern for 1.26.51.1.
-    TH_LOGI("TargetHUD: GameModeAttack NOT hooked (crash-safe)");
-    g_attackHooked = false;
-    g_attackOrig = nullptr;
-    (void)attackDetour;
+template <int Slot>
+std::uintptr_t attackDetour(void* a0, void* a1, void* a2, void* a3) {
+    noteAttack(a1, Slot);
+    return g_attackOrig[Slot] ? g_attackOrig[Slot](a0, a1, a2, a3) : 0;
+}
+
+void tryInstallAttackHooks() {
+    struct Entry {
+        int slot;
+        SignatureId id;
+        void* detour;
+    };
+    // Internal first: it has a real, long prologue signature (the other two are tiny stubs).
+    const Entry entries[kAttackSlots] = {
+        {2, SignatureId::GameModeAttackInternal, reinterpret_cast<void*>(&attackDetour<2>)},
+        {0, SignatureId::GameModeAttack, reinterpret_cast<void*>(&attackDetour<0>)},
+        {1, SignatureId::SurvivalModeAttack, reinterpret_cast<void*>(&attackDetour<1>)},
+    };
+    std::uintptr_t hookedAddrs[kAttackSlots] = {};
+    int hookedCount = 0;
+    int okCount = 0;
+    for (const auto& e : entries) {
+        if (g_attackHooked[e.slot]) {
+            ++okCount;
+            continue;
+        }
+        const auto addr = bactro::memory::resolve(e.id);
+        if (!addr) {
+            logLine("TargetHUD: %s signature NOT found", kAttackNames[e.slot]);
+            continue;
+        }
+        bool dup = false;
+        for (int k = 0; k < hookedCount; ++k) dup = dup || hookedAddrs[k] == addr;
+        if (dup) {
+            logLine("TargetHUD: %s @%p same address as another attack hook, skipped", kAttackNames[e.slot],
+                    reinterpret_cast<void*>(addr));
+            continue;
+        }
+        void* o = nullptr;
+        if (bactro::memory::hook(e.id, e.detour, &o)) {
+            g_attackOrig[e.slot] = reinterpret_cast<RawAttackFn>(o);
+            g_attackHooked[e.slot] = true;
+            hookedAddrs[hookedCount++] = addr;
+            ++okCount;
+            logLine("TargetHUD: %s hooked @%p", kAttackNames[e.slot], reinterpret_cast<void*>(addr));
+        } else {
+            logLine("TargetHUD: %s hook FAILED @%p (already hooked by another mod?)", kAttackNames[e.slot],
+                    reinterpret_cast<void*>(addr));
+        }
+    }
+    logLine("TargetHUD: attack hooks active=%d/3", okCount);
 }
 
 void resolveActorFns() {
-    // Do not bind getNameTag / isPlayer — calling them with wrong ABI crashes.
-    g_getNameTag = nullptr;
-    g_isPlayer = nullptr;
-    TH_LOGI("TargetHUD: native name/isPlayer calls disabled (crash-safe)");
+    auto nt = bactro::memory::resolve(SignatureId::ActorGetNameTag);
+    if (nt) g_getNameTag = reinterpret_cast<ActorGetNameTagFn>(nt);
+    auto ip = bactro::memory::resolve(SignatureId::ActorIsPlayer);
+    if (ip) g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(ip);
 }
 
 // ---- draw (ProtoHax style) ----
@@ -511,6 +588,12 @@ void submitHud() {
         }
     }
 
+    static bool s_drawnLogged = false;
+    if (!s_drawnLogged) {
+        s_drawnLogged = true;
+        logLine("TargetHUD: first card submitted name=%s hp=%.1f/%.1f", snap.name.c_str(), snap.displayHealth,
+                snap.maxHealth);
+    }
     pl::modmenu::submitDrawCommands(kModuleId, cmds);
 }
 
@@ -584,7 +667,7 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Target HUD");
-    b.description("Target card (crash-safe): head, 20/20, green→yellow→red bar. No combat hooks. Drag in HUD Editor.")
+    b.description("Target card: head, name, 20/20 (gold on gapple abs), green→yellow→red bar. Drag in HUD Editor.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -603,18 +686,20 @@ void registerModule() {
 
 void onSignaturesReady() {
     resolveActorFns();
-    tryInstallAttackHook();
+    logLine("TargetHUD: getNameTag=%s isPlayer=%s", g_getNameTag ? "ok" : "MISSING", g_isPlayer ? "ok" : "MISSING");
+    tryInstallAttackHooks();
 }
 
 void onFrame() {
     if (!g_enabled.load()) return;
-    try {
-        syncPacketHealth();
-        tickAnim();
-        submitHud();
-    } catch (...) {
-        // Never let HUD draw take down the game
+    static bool s_first = true;
+    if (s_first) {
+        s_first = false;
+        logLine("TargetHUD: onFrame running (NormalTick alive)");
     }
+    syncPacketHealth();
+    tickAnim();
+    submitHud();
 }
 
 void onAttack(void* targetActor) {
