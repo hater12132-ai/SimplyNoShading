@@ -5,6 +5,7 @@
 #include <pl/ModMenu.hpp>
 #include <pl/memory/Hook.hpp>
 
+#include <EGL/egl.h>
 #include <android/log.h>
 #include <dlfcn.h>
 
@@ -21,9 +22,8 @@ using GLsizei = int;
 using GLenum = unsigned int;
 using GLboolean = unsigned char;
 using GLfloat = float;
-using GLbitfield = unsigned int;
+using GLuint = unsigned int;
 
-// GLES2 constants we need
 constexpr GLenum GL_BLEND = 0x0BE2;
 constexpr GLenum GL_BLEND_SRC_RGB = 0x80C9;
 constexpr GLenum GL_BLEND_DST_RGB = 0x80C8;
@@ -36,16 +36,9 @@ constexpr GLenum GL_LESS = 0x0201;
 constexpr GLenum GL_SRC_ALPHA = 0x0302;
 constexpr GLenum GL_ONE = 1;
 constexpr GLenum GL_ONE_MINUS_SRC_ALPHA = 0x0303;
-constexpr GLenum GL_FUNC_ADD = 0x8006;
-constexpr GLenum GL_BLEND_EQUATION_RGB = 0x8009;
-constexpr GLenum GL_COLOR_WRITEMASK = 0x0C23;
-constexpr GLenum GL_STENCIL_TEST = 0x0B90;
-constexpr GLenum GL_ALWAYS = 0x0207;
-constexpr GLenum GL_KEEP = 0x1E00;
-constexpr GLenum GL_REPLACE = 0x1E01;
-constexpr GLenum GL_NOTEQUAL = 0x0205;
-constexpr GLenum GL_EQUAL = 0x0202;
-constexpr GLenum GL_STENCIL_BUFFER_BIT = 0x00000400;
+constexpr GLenum GL_TRIANGLES = 0x0004;
+constexpr GLenum GL_TRIANGLE_STRIP = 0x0005;
+constexpr GLenum GL_TRIANGLE_FAN = 0x0006;
 
 namespace bactro::handshader {
 namespace {
@@ -55,8 +48,8 @@ constexpr const char* kModuleId = "bactro.handshader";
 std::atomic_bool g_enabled{true};
 std::atomic_bool g_hideVanillaHand{false};
 std::atomic_bool g_glow{true};
-std::atomic<float> g_glowStrength{0.65f}; // 0..1 blend toward additive
 
+// Stays true from renderFirstPerson until eglSwapBuffers (hand is drawn late / deferred).
 std::atomic_bool g_handPhase{false};
 std::atomic_int g_drawHits{0};
 std::atomic_int g_glowHits{0};
@@ -67,26 +60,37 @@ bool g_renderFpHooked = false;
 
 using GlDrawElementsFn = void (*)(GLenum mode, GLsizei count, GLenum type, const void* indices);
 using GlDrawArraysFn = void (*)(GLenum mode, GLint first, GLsizei count);
+using GlDrawElementsInstancedFn = void (*)(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                           GLsizei primcount);
+using GlDrawArraysInstancedFn = void (*)(GLenum mode, GLint first, GLsizei count, GLsizei primcount);
+using GlDrawRangeElementsFn = void (*)(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
+                                       const void* indices);
+
 using GlEnableFn = void (*)(GLenum);
 using GlDisableFn = void (*)(GLenum);
 using GlBlendFuncFn = void (*)(GLenum, GLenum);
-using GlBlendFuncSeparateFn = void (*)(GLenum, GLenum, GLenum, GLenum);
 using GlGetIntegervFn = void (*)(GLenum, GLint*);
 using GlIsEnabledFn = GLboolean (*)(GLenum);
 using GlDepthFuncFn = void (*)(GLenum);
-using GlColorMaskFn = void (*)(GLboolean, GLboolean, GLboolean, GLboolean);
-using GlLineWidthFn = void (*)(GLfloat);
+
+using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
 
 GlDrawElementsFn g_glDrawElements = nullptr;
 GlDrawArraysFn g_glDrawArrays = nullptr;
+GlDrawElementsInstancedFn g_glDrawElementsInstanced = nullptr;
+GlDrawArraysInstancedFn g_glDrawArraysInstanced = nullptr;
+GlDrawRangeElementsFn g_glDrawRangeElements = nullptr;
+
 GlEnableFn g_glEnable = nullptr;
 GlDisableFn g_glDisable = nullptr;
 GlBlendFuncFn g_glBlendFunc = nullptr;
 GlGetIntegervFn g_glGetIntegerv = nullptr;
 GlIsEnabledFn g_glIsEnabled = nullptr;
 GlDepthFuncFn g_glDepthFunc = nullptr;
-GlColorMaskFn g_glColorMask = nullptr;
+
+EglSwapBuffersFn g_eglSwapBuffers = nullptr;
 bool g_glHooked = false;
+bool g_swapHooked = false;
 
 void logLine(const char* fmt, ...) {
     char buf[192];
@@ -98,10 +102,18 @@ void logLine(const char* fmt, ...) {
     HS_LOGI("%s", buf);
 }
 
+void* resolveGl(const char* name) {
+    // eglGetProcAddress returns the pointer the game actually calls (ANGLE / driver).
+    if (void* p = reinterpret_cast<void*>(eglGetProcAddress(name))) return p;
+    void* lib = dlopen("libGLESv2.so", RTLD_NOW);
+    if (!lib) lib = dlopen("libGLESv3.so", RTLD_NOW);
+    if (!lib) return nullptr;
+    return dlsym(lib, name);
+}
+
 struct BlendSnap {
     GLboolean blendOn = 0;
     GLint srcRgb = GL_ONE, dstRgb = GL_ONE_MINUS_SRC_ALPHA;
-    GLint srcA = GL_ONE, dstA = GL_ONE_MINUS_SRC_ALPHA;
     GLint depthFunc = GL_LESS;
     GLboolean depthOn = 1;
 };
@@ -115,8 +127,6 @@ BlendSnap saveBlend() {
     if (g_glGetIntegerv) {
         g_glGetIntegerv(GL_BLEND_SRC_RGB, &s.srcRgb);
         g_glGetIntegerv(GL_BLEND_DST_RGB, &s.dstRgb);
-        g_glGetIntegerv(GL_BLEND_SRC_ALPHA, &s.srcA);
-        g_glGetIntegerv(GL_BLEND_DST_ALPHA, &s.dstA);
         g_glGetIntegerv(GL_DEPTH_FUNC, &s.depthFunc);
     }
     return s;
@@ -132,110 +142,217 @@ void restoreBlend(const BlendSnap& s) {
     else g_glDisable(GL_DEPTH_TEST);
 }
 
-// Soft additive pass: draw again with ONE,ONE so the hand/item brightens at edges of coverage.
-// Full state restored after — must not leave persistent GL state for the world.
-void drawWithGlow(void (*drawFn)(void*), void* ctx) {
+bool isTriangleMode(GLenum mode) {
+    return mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN;
+}
+
+// Only glow small-ish draws (hand/item), skip huge world chunks if phase is wide.
+bool looksLikeHandDraw(GLsizei count) {
+    // Hand/item meshes are small. World chunks are large.
+    return count > 0 && count < 4000;
+}
+
+void applyGlowSecondPass(void (*drawOnce)(void*), void* ctx) {
     if (!g_glow.load(std::memory_order_relaxed) || !g_glEnable || !g_glBlendFunc) {
-        drawFn(ctx);
+        drawOnce(ctx);
         return;
     }
     const BlendSnap snap = saveBlend();
-
-    // Normal pass
-    drawFn(ctx);
-
-    // Additive glow pass (second draw of same geometry)
+    drawOnce(ctx); // normal
     g_glEnable(GL_BLEND);
     g_glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     if (g_glDepthFunc) g_glDepthFunc(GL_LEQUAL);
-    drawFn(ctx);
-
+    drawOnce(ctx); // additive
     restoreBlend(snap);
     const int n = g_glowHits.fetch_add(1, std::memory_order_relaxed);
-    if (n < 6) logLine("HandShader: glow pass #%d", n);
+    if (n < 8) logLine("HandShader: glow pass #%d", n);
 }
 
-struct DrawElementsCtx {
+struct DECtx {
     GLenum mode;
     GLsizei count;
     GLenum type;
     const void* indices;
 };
-struct DrawArraysCtx {
+struct DACtx {
     GLenum mode;
     GLint first;
     GLsizei count;
 };
+struct DEICtx {
+    GLenum mode;
+    GLsizei count;
+    GLenum type;
+    const void* indices;
+    GLsizei primcount;
+};
+struct DAICtx {
+    GLenum mode;
+    GLint first;
+    GLsizei count;
+    GLsizei primcount;
+};
+struct DRECtx {
+    GLenum mode;
+    GLuint start;
+    GLuint end;
+    GLsizei count;
+    GLenum type;
+    const void* indices;
+};
 
-void doDrawElements(void* p) {
-    auto* c = static_cast<DrawElementsCtx*>(p);
+void doDE(void* p) {
+    auto* c = static_cast<DECtx*>(p);
     if (g_glDrawElements) g_glDrawElements(c->mode, c->count, c->type, c->indices);
 }
-void doDrawArrays(void* p) {
-    auto* c = static_cast<DrawArraysCtx*>(p);
+void doDA(void* p) {
+    auto* c = static_cast<DACtx*>(p);
     if (g_glDrawArrays) g_glDrawArrays(c->mode, c->first, c->count);
+}
+void doDEI(void* p) {
+    auto* c = static_cast<DEICtx*>(p);
+    if (g_glDrawElementsInstanced)
+        g_glDrawElementsInstanced(c->mode, c->count, c->type, c->indices, c->primcount);
+}
+void doDAI(void* p) {
+    auto* c = static_cast<DAICtx*>(p);
+    if (g_glDrawArraysInstanced) g_glDrawArraysInstanced(c->mode, c->first, c->count, c->primcount);
+}
+void doDRE(void* p) {
+    auto* c = static_cast<DRECtx*>(p);
+    if (g_glDrawRangeElements)
+        g_glDrawRangeElements(c->mode, c->start, c->end, c->count, c->type, c->indices);
+}
+
+bool inHandGlowWindow() {
+    return g_enabled.load(std::memory_order_relaxed) && g_handPhase.load(std::memory_order_acquire) &&
+           !g_hideVanillaHand.load(std::memory_order_relaxed);
 }
 
 void glDrawElementsDetour(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    if (g_enabled.load(std::memory_order_relaxed) && g_handPhase.load(std::memory_order_acquire) &&
-        !g_hideVanillaHand.load(std::memory_order_relaxed) && count > 0) {
+    if (inHandGlowWindow() && isTriangleMode(mode) && looksLikeHandDraw(count)) {
         g_drawHits.fetch_add(1, std::memory_order_relaxed);
-        DrawElementsCtx ctx{mode, count, type, indices};
-        drawWithGlow(&doDrawElements, &ctx);
+        DECtx ctx{mode, count, type, indices};
+        applyGlowSecondPass(&doDE, &ctx);
         return;
     }
     if (g_glDrawElements) g_glDrawElements(mode, count, type, indices);
 }
 
 void glDrawArraysDetour(GLenum mode, GLint first, GLsizei count) {
-    if (g_enabled.load(std::memory_order_relaxed) && g_handPhase.load(std::memory_order_acquire) &&
-        !g_hideVanillaHand.load(std::memory_order_relaxed) && count > 0) {
+    if (inHandGlowWindow() && isTriangleMode(mode) && looksLikeHandDraw(count)) {
         g_drawHits.fetch_add(1, std::memory_order_relaxed);
-        DrawArraysCtx ctx{mode, first, count};
-        drawWithGlow(&doDrawArrays, &ctx);
+        DACtx ctx{mode, first, count};
+        applyGlowSecondPass(&doDA, &ctx);
         return;
     }
     if (g_glDrawArrays) g_glDrawArrays(mode, first, count);
 }
 
-void tryHookGles() {
-    if (g_glHooked) return;
-    void* lib = dlopen("libGLESv2.so", RTLD_NOW);
-    if (!lib) lib = dlopen("libGLESv3.so", RTLD_NOW);
-    if (!lib) lib = dlopen("libGLESv2.so.2", RTLD_NOW);
-    if (!lib) {
-        logLine("HandShader: libGLESv2 missing");
+void glDrawElementsInstancedDetour(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                   GLsizei primcount) {
+    if (inHandGlowWindow() && isTriangleMode(mode) && looksLikeHandDraw(count)) {
+        g_drawHits.fetch_add(1, std::memory_order_relaxed);
+        DEICtx ctx{mode, count, type, indices, primcount};
+        applyGlowSecondPass(&doDEI, &ctx);
         return;
     }
+    if (g_glDrawElementsInstanced)
+        g_glDrawElementsInstanced(mode, count, type, indices, primcount);
+}
 
-    auto sym = [&](const char* n) { return dlsym(lib, n); };
+void glDrawArraysInstancedDetour(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
+    if (inHandGlowWindow() && isTriangleMode(mode) && looksLikeHandDraw(count)) {
+        g_drawHits.fetch_add(1, std::memory_order_relaxed);
+        DAICtx ctx{mode, first, count, primcount};
+        applyGlowSecondPass(&doDAI, &ctx);
+        return;
+    }
+    if (g_glDrawArraysInstanced) g_glDrawArraysInstanced(mode, first, count, primcount);
+}
 
-    g_glEnable = reinterpret_cast<GlEnableFn>(sym("glEnable"));
-    g_glDisable = reinterpret_cast<GlDisableFn>(sym("glDisable"));
-    g_glBlendFunc = reinterpret_cast<GlBlendFuncFn>(sym("glBlendFunc"));
-    g_glGetIntegerv = reinterpret_cast<GlGetIntegervFn>(sym("glGetIntegerv"));
-    g_glIsEnabled = reinterpret_cast<GlIsEnabledFn>(sym("glIsEnabled"));
-    g_glDepthFunc = reinterpret_cast<GlDepthFuncFn>(sym("glDepthFunc"));
-    g_glColorMask = reinterpret_cast<GlColorMaskFn>(sym("glColorMask"));
+void glDrawRangeElementsDetour(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
+                               const void* indices) {
+    if (inHandGlowWindow() && isTriangleMode(mode) && looksLikeHandDraw(count)) {
+        g_drawHits.fetch_add(1, std::memory_order_relaxed);
+        DRECtx ctx{mode, start, end, count, type, indices};
+        applyGlowSecondPass(&doDRE, &ctx);
+        return;
+    }
+    if (g_glDrawRangeElements) g_glDrawRangeElements(mode, start, end, count, type, indices);
+}
+
+EGLBoolean eglSwapBuffersDetour(EGLDisplay dpy, EGLSurface surface) {
+    // End hand phase for this frame (hand was submitted earlier in the frame).
+    g_handPhase.store(false, std::memory_order_release);
+    return g_eglSwapBuffers ? g_eglSwapBuffers(dpy, surface) : EGL_FALSE;
+}
+
+bool hookSym(void* target, void* detour, void** original) {
+    if (!target) return false;
+    return pl::memory::hook(target, detour, original) == 0;
+}
+
+void tryHookGles() {
+    if (g_glHooked) return;
+
+    g_glEnable = reinterpret_cast<GlEnableFn>(resolveGl("glEnable"));
+    g_glDisable = reinterpret_cast<GlDisableFn>(resolveGl("glDisable"));
+    g_glBlendFunc = reinterpret_cast<GlBlendFuncFn>(resolveGl("glBlendFunc"));
+    g_glGetIntegerv = reinterpret_cast<GlGetIntegervFn>(resolveGl("glGetIntegerv"));
+    g_glIsEnabled = reinterpret_cast<GlIsEnabledFn>(resolveGl("glIsEnabled"));
+    g_glDepthFunc = reinterpret_cast<GlDepthFuncFn>(resolveGl("glDepthFunc"));
 
     int ok = 0;
-    if (void* p = sym("glDrawElements")) {
-        void* o = nullptr;
-        if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawElementsDetour), &o) == 0) {
-            g_glDrawElements = reinterpret_cast<GlDrawElementsFn>(o);
-            ++ok;
-        }
+    void* o = nullptr;
+
+    if (hookSym(resolveGl("glDrawElements"), reinterpret_cast<void*>(&glDrawElementsDetour), &o)) {
+        g_glDrawElements = reinterpret_cast<GlDrawElementsFn>(o);
+        ++ok;
     }
-    if (void* p = sym("glDrawArrays")) {
-        void* o = nullptr;
-        if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawArraysDetour), &o) == 0) {
-            g_glDrawArrays = reinterpret_cast<GlDrawArraysFn>(o);
-            ++ok;
+    o = nullptr;
+    if (hookSym(resolveGl("glDrawArrays"), reinterpret_cast<void*>(&glDrawArraysDetour), &o)) {
+        g_glDrawArrays = reinterpret_cast<GlDrawArraysFn>(o);
+        ++ok;
+    }
+    o = nullptr;
+    if (hookSym(resolveGl("glDrawElementsInstanced"), reinterpret_cast<void*>(&glDrawElementsInstancedDetour),
+                &o)) {
+        g_glDrawElementsInstanced = reinterpret_cast<GlDrawElementsInstancedFn>(o);
+        ++ok;
+    }
+    o = nullptr;
+    if (hookSym(resolveGl("glDrawArraysInstanced"), reinterpret_cast<void*>(&glDrawArraysInstancedDetour),
+                &o)) {
+        g_glDrawArraysInstanced = reinterpret_cast<GlDrawArraysInstancedFn>(o);
+        ++ok;
+    }
+    o = nullptr;
+    if (hookSym(resolveGl("glDrawRangeElements"), reinterpret_cast<void*>(&glDrawRangeElementsDetour), &o)) {
+        g_glDrawRangeElements = reinterpret_cast<GlDrawRangeElementsFn>(o);
+        ++ok;
+    }
+
+    // Extend phase until end of frame
+    if (!g_swapHooked) {
+        void* swap = reinterpret_cast<void*>(eglGetProcAddress("eglSwapBuffers"));
+        if (!swap) {
+            void* egl = dlopen("libEGL.so", RTLD_NOW);
+            if (!egl) egl = dlopen("libEGL.so.1", RTLD_NOW);
+            if (egl) swap = dlsym(egl, "eglSwapBuffers");
+        }
+        o = nullptr;
+        if (hookSym(swap, reinterpret_cast<void*>(&eglSwapBuffersDetour), &o)) {
+            g_eglSwapBuffers = reinterpret_cast<EglSwapBuffersFn>(o);
+            g_swapHooked = true;
+            logLine("HandShader: eglSwapBuffers hooked (hand phase until present)");
+        } else {
+            logLine("HandShader: eglSwapBuffers hook FAILED");
         }
     }
 
     g_glHooked = ok > 0;
-    logLine("HandShader: draw hooks %d/2 glow=%d (state restored each draw)", ok,
+    logLine("HandShader: draw hooks %d/5 glow=%d phase=until-swap", ok,
             g_glBlendFunc && g_glEnable ? 1 : 0);
 }
 
@@ -254,13 +371,14 @@ void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4,
         return;
     }
 
+    // Stay active until eglSwapBuffers clears it (deferred draws).
     g_handPhase.store(true, std::memory_order_release);
     if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
-    g_handPhase.store(false, std::memory_order_release);
+    // do NOT clear handPhase here
 
     static int s_log = 0;
-    if (s_log < 5) {
-        logLine("HandShader: renderFP ok draws=%d glow=%d", g_drawHits.load(), g_glowHits.load());
+    if (s_log < 6) {
+        logLine("HandShader: renderFP armed draws=%d glow=%d", g_drawHits.load(), g_glowHits.load());
         ++s_log;
     }
 }
@@ -282,14 +400,13 @@ void tryInstallHooks() {
 
 void onToggle(std::string_view, bool enabled) {
     g_enabled.store(enabled, std::memory_order_release);
+    if (!enabled) g_handPhase.store(false, std::memory_order_release);
 }
 
 void onConfig(std::string_view, std::string_view key, std::string_view value) {
     try {
         if (key == "glow")
             g_glow.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "glowStrength")
-            g_glowStrength.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "hideHand")
             g_hideVanillaHand.store(value == "true" || value == "1", std::memory_order_relaxed);
     } catch (...) {
@@ -300,14 +417,11 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Shader");
-    b.description(
-         "Hand/item glow (additive second pass, GL state restored). "
-         "True colored outline needs a custom shader — not available on this path. Hide hand works.")
+    b.description("Hand/item additive glow (draws after FP until swap). Hide hand. Not a vector outline.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
     b.config("glow", "Hand glow", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("glowStrength", "Glow strength", pl::modmenu::ConfigType::SliderFloat, "0.65", "0.1", "1", "");
     b.config("hideHand", "Hide hand / item", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
 }
