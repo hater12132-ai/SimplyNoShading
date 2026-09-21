@@ -275,7 +275,7 @@ void applyTarget(void* actor, bool fromHit) {
     }
 
     if (!same) {
-        // New target: assume full HP until UpdateAttributesPacket arrives
+        // New target: assume full HP until a real packet (or confirmed hurt) updates it.
         g_target.health = 20.f;
         g_target.maxHealth = 20.f;
         g_target.displayHealth = 20.f;
@@ -287,24 +287,11 @@ void applyTarget(void* actor, bool fromHit) {
         g_target.headKey.clear();
         g_target.hurtFlash = fromHit ? 1.f : 0.f;
         g_target.hitCount = fromHit ? 1 : 0;
-    } else if (fromHit) {
-        // Client estimate when server keeps broadcasting full HP for other players (Hive).
-        // Real UA damage (current < max) still wins via syncPacketHealth.
-        constexpr float kHitDmg = 2.0f;
-        float remain = kHitDmg;
-        if (g_target.absorption > 0.f) {
-            const float used = std::min(g_target.absorption, remain);
-            g_target.absorption -= used;
-            remain -= used;
-        }
-        if (remain > 0.f) g_target.health = std::max(0.f, g_target.health - remain);
-        if (g_target.health <= 0.01f) {
-            g_target.health = 0.f;
-            g_target.absorption = 0.f;
-            g_target.dead = true;
-            g_target.diedAt = std::chrono::steady_clock::now();
-        }
     }
+    // IMPORTANT: do NOT drain HP on every GameModeAttack click. Spam swings fire this
+    // detour even when the server rejects the hit / i-frames apply. HP only moves on:
+    //   - UpdateAttributes with real current < max (syncPacketHealth)
+    //   - ActorEvent hurt (applyRuntimeTarget) once per confirmed hurt animation
 }
 
 // Packet-driven target: someone (not us) just took damage / played the hurt animation.
@@ -339,36 +326,24 @@ void applyRuntimeTarget(uint64_t rid) {
         g_target.liveHealth = false;
         g_target.health = g_target.displayHealth = 20.f;
         g_target.maxHealth = 20.f;
-        if (auto h = bactro::health::get(rid)) {
-            g_target.maxHealth = h->max > 0.f ? h->max : 20.f;
-            // Only trust packet if it already shows damage (Hive often sends 20/20 forever)
-            if (h->current < h->max - 0.25f || h->absorption > 0.05f) {
-                g_target.health = g_target.displayHealth = h->current;
-                g_target.absorption = h->absorption;
-                g_target.liveHealth = true;
+        {
+            auto h = bactro::health::displayHealth(rid);
+            if (h.valid) {
+                g_target.health = h.current;
+                g_target.maxHealth = h.max > 0.f ? h.max : 20.f;
+                g_target.absorption = h.absorption;
+                g_target.displayHealth = h.current;
+                g_target.liveHealth = h.fromPacket;
             }
         }
     } else {
         ++g_target.hitCount;
-        if (auto h = bactro::health::get(rid)) {
-            if (h->current < g_target.health - 0.05f || h->absorption > g_target.absorption + 0.05f ||
-                (h->max > 0.f && h->current < h->max - 0.25f && h->current < g_target.health + 0.01f)) {
-                g_target.health = h->current;
-                g_target.maxHealth = h->max > 0.f ? h->max : g_target.maxHealth;
-                g_target.absorption = h->absorption;
-                g_target.liveHealth = true;
-            }
-        }
-        // Hurt animation = someone took a hit: step estimate when packet still says full HP
-        if (!g_target.liveHealth || g_target.health >= g_target.maxHealth - 0.25f) {
-            constexpr float kHitDmg = 2.0f;
-            float remain = kHitDmg;
-            if (g_target.absorption > 0.f) {
-                const float used = std::min(g_target.absorption, remain);
-                g_target.absorption -= used;
-                remain -= used;
-            }
-            if (remain > 0.f) g_target.health = std::max(0.f, g_target.health - remain);
+        auto h = bactro::health::displayHealth(rid);
+        if (h.valid) {
+            g_target.health = h.current;
+            g_target.maxHealth = h.max > 0.f ? h.max : g_target.maxHealth;
+            g_target.absorption = h.absorption;
+            g_target.liveHealth = h.fromPacket;
         }
     }
 }
@@ -402,20 +377,17 @@ void syncPacketHealth() {
     const uint64_t self = bactro::health::selfRuntimeId();
 
     if (g_target.runtimeId != 0) {
-        if (g_target.runtimeId == self) return; // never show self as target via packets
-        if (auto h = bactro::health::get(g_target.runtimeId)) {
-            if (shouldApplyPacketHp(h->current, h->max, h->absorption, g_target.health, g_target.absorption,
-                                    g_target.liveHealth)) {
-                g_target.health = h->current;
-                g_target.maxHealth = h->max > 0.f ? h->max : g_target.maxHealth;
-                g_target.absorption = h->absorption;
-                g_target.liveHealth = true;
-                if (h->current <= 0.01f) {
-                    g_target.dead = true;
-                    g_target.diedAt = now;
-                }
-            } else if (h->max > 0.f) {
-                g_target.maxHealth = h->max;
+        if (g_target.runtimeId == self) return;
+        auto h = bactro::health::displayHealth(g_target.runtimeId);
+        if (h.valid) {
+            // Always take prediction/display tracker; real packets already folded in
+            g_target.health = h.current;
+            g_target.maxHealth = h.max > 0.f ? h.max : g_target.maxHealth;
+            g_target.absorption = h.absorption;
+            g_target.liveHealth = h.fromPacket;
+            if (h.current <= 0.01f) {
+                g_target.dead = true;
+                g_target.diedAt = now;
             }
         }
         return;
@@ -467,6 +439,13 @@ void noteAttack(void* target, int slot) {
     if (logBudget()) logLine("TargetHUD: attack via %s target=%p", kAttackNames[slot], clean);
     try {
         applyTarget(clean, true);
+        // Solstice: arm pending damage; applied only when hurt event confirms
+        uint64_t rid = 0;
+        {
+            std::lock_guard lock(g_mutex);
+            rid = g_target.runtimeId;
+        }
+        bactro::health::noteOutgoingSwing(rid);
     } catch (...) {
     }
 }
@@ -781,12 +760,16 @@ void onFrame() {
         logLine("TargetHUD: onFrame running (NormalTick alive)");
     }
     // 1) Our outbound attack packets (when InvTx parses as UseItemOnEntity)
-    for (uint64_t rid; bactro::health::popMyHit(rid);) applyRuntimeTarget(rid);
-    // 2) Incoming ActorEvent hurt — works on Hive (seen in 1.4.0 log). Prefer non-self.
-    //    For duels this is the reliable path; nearby fights may briefly steal the card.
-    for (uint64_t rid; bactro::health::popHurt(rid);) {
-        if (rid != 0 && rid != bactro::health::selfRuntimeId()) applyRuntimeTarget(rid);
+    for (uint64_t rid; bactro::health::popMyHit(rid);) {
+        applyRuntimeTarget(rid);
+        bactro::health::noteOutgoingSwing(rid);
     }
+    for (uint64_t rid; bactro::health::popHurt(rid);) {
+        if (rid == 0 || rid == bactro::health::selfRuntimeId()) continue;
+        bactro::health::noteHurt(rid); // Solstice-style: apply pending dmg once per hurt
+        applyRuntimeTarget(rid);
+    }
+    bactro::health::tickPrediction();
     syncPacketHealth();
     tickAnim();
     submitHud();

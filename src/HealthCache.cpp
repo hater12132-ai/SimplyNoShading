@@ -10,6 +10,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
+#include <chrono>
+#include <algorithm>
 
 #define HC_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
 
@@ -26,6 +29,21 @@ uint64_t g_self = 0;
 std::vector<uint64_t> g_hurt;
 std::vector<uint64_t> g_myHit;
 int g_seenMask = 0; // which packet ids we already logged once
+
+// Solstice-style predicted HP when server never sends real remote HP
+struct Pred {
+    float health = 20.f;
+    float maxHealth = 20.f;
+    float absorption = 0.f;
+    float lastAbsorption = 0.f;
+    float pendingDamage = 0.f; // damage to apply on next confirmed hurt
+    bool trusted = false;      // true once real UA (current < max) seen
+    std::chrono::steady_clock::time_point lastHurt{};
+    std::chrono::steady_clock::time_point lastHeal{};
+};
+std::unordered_map<uint64_t, Pred> g_pred;
+uint64_t g_lastSwingTarget = 0;
+std::chrono::steady_clock::time_point g_lastSwingTime{};
 
 void logOnce(int bit, const char* what) {
     {
@@ -290,7 +308,91 @@ void parseActorEvent(Reader& r) {
     if (ev == 2) { // HURT_ANIMATION
         pushHurt(runtimeId);
         logOnce(3, "pkt ActorEvent hurt seen");
+        {
+            static int s_hurtLog = 0;
+            if (s_hurtLog < 8) {
+                char b[80];
+                std::snprintf(b, sizeof(b), "hurt event rid=%llu", (unsigned long long)runtimeId);
+                bactro::statusLine(b);
+                ++s_hurtLog;
+            }
+        }
+    } else if (ev == 3) { // DEATH
+        EntityHealth h{};
+        h.current = 0.f;
+        h.max = 20.f;
+        h.valid = true;
+        setHealth(runtimeId, 0.f, 20.f, 0.f);
+        pushHurt(runtimeId);
+        {
+            char b[64];
+            std::snprintf(b, sizeof(b), "death event rid=%llu", (unsigned long long)runtimeId);
+            bactro::statusLine(b);
+        }
     }
+}
+
+// SetActorData (id 39): runtimeId + metadata entries. Some builds put health as a float property.
+void parseSetActorData(Reader& r) {
+    uint64_t runtimeId = 0;
+    if (!r.readVarU64(runtimeId)) return;
+    // Metadata: repeated until end — id (unsigned varint), type (unsigned varint), value
+    // Types: 0=u8, 1=i16, 2=i32, 3=f32, 4=string, 5=nbt, 6=i64, 7=vec3, ...
+    static int s_log = 0;
+    int floats = 0;
+    float lastFloat = -1.f;
+    while (r.ok() && r.left() >= 2) {
+        uint32_t key = 0, type = 0;
+        if (!r.readVarU32(key) || !r.readVarU32(type)) break;
+        if (type == 0) { // byte
+            uint8_t v;
+            if (!r.readU8(v)) break;
+        } else if (type == 1) { // short
+            if (r.left() < 2) break;
+            r.p += 2;
+        } else if (type == 2) { // int
+            if (r.left() < 4) break;
+            r.p += 4;
+        } else if (type == 3) { // float — candidate for health
+            float v = 0.f;
+            if (!r.readF32(v)) break;
+            ++floats;
+            lastFloat = v;
+            // Player health is typically 0..40 (max with effects). Prefer 0..20 range updates.
+            if (v >= 0.f && v <= 40.f && runtimeId != 0) {
+                // Only apply if it looks like a health snapshot (not random floats)
+                if (v <= 20.01f) {
+                    auto prev = get(runtimeId);
+                    float prevCur = prev ? prev->current : 20.f;
+                    // Accept if lower than previous or first time and not a default noise
+                    if (v < prevCur - 0.05f || (v < 19.5f && (!prev || !prev->valid))) {
+                        setHealth(runtimeId, v, prev ? prev->max : 20.f, prev ? prev->absorption : 0.f);
+                        if (s_log < 10) {
+                            char b[96];
+                            std::snprintf(b, sizeof(b), "SetActorData rid=%llu float=%.1f key=%u -> HP",
+                                          (unsigned long long)runtimeId, v, key);
+                            bactro::statusLine(b);
+                            ++s_log;
+                        }
+                    }
+                }
+            }
+        } else if (type == 4) { // string
+            std::string s;
+            if (!r.readString(s)) break;
+        } else if (type == 6) { // long
+            if (r.left() < 8) break;
+            r.p += 8;
+        } else if (type == 7) { // vec3
+            if (r.left() < 12) break;
+            r.p += 12;
+        } else {
+            // Unknown type — abort this packet to avoid desync
+            break;
+        }
+    }
+    (void)floats;
+    (void)lastFloat;
 }
 
 void dispatchPacket(const uint8_t* d, size_t n) {
@@ -324,6 +426,7 @@ void dispatchPacket(const uint8_t* d, size_t n) {
         logOnce(4, "pkt UpdateAttributes seen");
         parseUpdateAttributesPayload(r);
         break;
+    case 39: parseSetActorData(r); break;
     default: break;
     }
 }
@@ -453,14 +556,28 @@ void setHealth(uint64_t runtimeId, float current, float max, float absorption) {
     e.max = max > 0.f ? max : (e.max > 0.f ? e.max : 20.f);
     e.absorption = absorption;
     e.valid = true;
+    e.fromPacket = (current < e.max - 0.25f) || (absorption > 0.05f);
     g_lastRuntimeId = runtimeId;
     g_lastHealth = e;
     g_hasLast = true;
+
+    auto& pred = g_pred[runtimeId];
+    if (e.fromPacket) {
+        pred.health = current;
+        pred.maxHealth = e.max;
+        pred.trusted = true;
+    }
+    if (absorption < pred.lastAbsorption - 0.05f)
+        pred.pendingDamage = std::max(pred.pendingDamage, pred.lastAbsorption - absorption);
+    pred.absorption = absorption;
+    pred.lastAbsorption = absorption;
+    if (e.max > 0.f) pred.maxHealth = e.max;
+
     static int s_log;
     if ((++s_log % 4) == 1) {
         char b[96];
-        std::snprintf(b, sizeof(b), "packet HP runtime=%llu cur=%.1f max=%.1f abs=%.1f",
-                      (unsigned long long)runtimeId, current, e.max, absorption);
+        std::snprintf(b, sizeof(b), "packet HP runtime=%llu cur=%.1f max=%.1f abs=%.1f real=%d",
+                      (unsigned long long)runtimeId, current, e.max, absorption, e.fromPacket ? 1 : 0);
         bactro::statusLine(b);
         HC_LOGI("%s", b);
     }
@@ -485,7 +602,9 @@ void clear() {
     g_names.clear();
     g_hurt.clear();
     g_myHit.clear();
+    g_pred.clear();
     g_hasLast = false;
+    g_lastSwingTarget = 0;
 }
 
 size_t playerCount() {
@@ -510,6 +629,119 @@ bool popHurt(uint64_t& runtimeId) {
     runtimeId = g_hurt.front();
     g_hurt.erase(g_hurt.begin());
     return true;
+}
+
+
+void noteOutgoingSwing(uint64_t runtimeIdHint) {
+    std::lock_guard lock(g_mu);
+    using clock = std::chrono::steady_clock;
+    g_lastSwingTime = clock::now();
+    if (runtimeIdHint != 0) g_lastSwingTarget = runtimeIdHint;
+    // Default pending melee damage (iron-ish, armor-unknown). Applied only on next hurt.
+    constexpr float kMelee = 4.0f;
+    if (runtimeIdHint != 0) {
+        auto& p = g_pred[runtimeIdHint];
+        if (!p.trusted) p.pendingDamage = std::max(p.pendingDamage, kMelee);
+    } else if (g_lastSwingTarget != 0) {
+        auto& p = g_pred[g_lastSwingTarget];
+        if (!p.trusted) p.pendingDamage = std::max(p.pendingDamage, kMelee);
+    }
+}
+
+void noteHurt(uint64_t runtimeId) {
+    if (runtimeId == 0) return;
+    std::lock_guard lock(g_mu);
+    if (runtimeId == g_self) return;
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    auto& p = g_pred[runtimeId];
+    if (p.trusted) {
+        // Real packet HP is authority; still refresh hurt timer for regen gating
+        p.lastHurt = now;
+        return;
+    }
+    // Prefer absorption-delta damage (Solstice); else pending from our swing; else small default
+    float dmg = 0.f;
+    if (p.pendingDamage > 0.05f) {
+        dmg = p.pendingDamage;
+        p.pendingDamage = 0.f;
+    } else if (p.absorption < p.lastAbsorption - 0.05f) {
+        dmg = p.lastAbsorption - p.absorption;
+    } else {
+        dmg = 2.0f; // half heart minimum on confirmed hurt animation
+    }
+    // If our swing was recent, this hurt is likely ours — full pending; else still apply dmg
+    if (g_lastSwingTarget == runtimeId || g_lastSwingTarget == 0) {
+        const float since = std::chrono::duration<float>(now - g_lastSwingTime).count();
+        if (since < 0.9f && dmg < 2.f) dmg = std::max(dmg, 2.f);
+    }
+    p.health = std::max(0.f, p.health - dmg);
+    p.lastHurt = now;
+    // Mirror into g_map so get()/display stay consistent
+    auto& e = g_map[runtimeId];
+    e.current = p.health;
+    e.max = p.maxHealth;
+    e.absorption = p.absorption;
+    e.valid = true;
+    e.fromPacket = false;
+    static int s_log = 0;
+    if (s_log < 15) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "predict HP rid=%llu dmg=%.1f -> %.1f/%.1f",
+                      (unsigned long long)runtimeId, dmg, p.health, p.maxHealth);
+        bactro::statusLine(b);
+        ++s_log;
+    }
+}
+
+void tickPrediction() {
+    std::lock_guard lock(g_mu);
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    for (auto& [rid, p] : g_pred) {
+        if (p.trusted) continue;
+        if (rid == g_self) continue;
+        // Solstice: +1 HP about every 4s if not recently hurt
+        const float sinceHurt = p.lastHurt.time_since_epoch().count() == 0
+                                    ? 999.f
+                                    : std::chrono::duration<float>(now - p.lastHurt).count();
+        if (sinceHurt < 3.0f) continue;
+        const float sinceHeal = p.lastHeal.time_since_epoch().count() == 0
+                                    ? 999.f
+                                    : std::chrono::duration<float>(now - p.lastHeal).count();
+        if (sinceHeal < 4.0f) continue;
+        if (p.health < p.maxHealth - 0.01f) {
+            p.health = std::min(p.maxHealth, p.health + 1.f);
+            p.lastHeal = now;
+            auto& e = g_map[rid];
+            e.current = p.health;
+            e.max = p.maxHealth;
+            e.valid = true;
+        }
+    }
+}
+
+EntityHealth displayHealth(uint64_t runtimeId) {
+    std::lock_guard lock(g_mu);
+    EntityHealth out{};
+    auto it = g_map.find(runtimeId);
+    auto pit = g_pred.find(runtimeId);
+    if (it != g_map.end() && it->second.valid && it->second.fromPacket) {
+        return it->second;
+    }
+    if (pit != g_pred.end()) {
+        out.current = pit->second.health;
+        out.max = pit->second.maxHealth;
+        out.absorption = pit->second.absorption;
+        out.valid = true;
+        out.fromPacket = pit->second.trusted;
+        return out;
+    }
+    if (it != g_map.end() && it->second.valid) return it->second;
+    out.current = 20.f;
+    out.max = 20.f;
+    out.valid = false;
+    return out;
 }
 
 } // namespace bactro::health
