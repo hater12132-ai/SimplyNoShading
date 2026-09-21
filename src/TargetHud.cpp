@@ -37,6 +37,7 @@ std::atomic_bool g_enabled{true};
 std::atomic_bool g_showOnLook{true};
 std::atomic_bool g_showOnHit{true};
 std::atomic_bool g_playersOnly{true};
+std::atomic_bool g_nativeAttack{false}; // experimental, off by default
 std::atomic<float> g_liveTime{5.0f};
 std::atomic<float> g_lookRange{3.0f};
 std::atomic<float> g_scale{1.0f};
@@ -289,7 +290,9 @@ void applyRuntimeTarget(uint64_t rid) {
     if (!g_enabled.load() || !g_showOnHit.load()) return;
     if (rid == 0 || rid == bactro::health::selfRuntimeId()) return;
     const std::string raw = bactro::health::playerName(rid);
-    if (raw.empty() && g_playersOnly.load()) return; // not a player we saw spawn (mob / unknown)
+    // Players-only: skip ids that are not a player we saw spawn (mobs). If the incoming packet path has not
+    // delivered a single AddPlayer yet (nothing known), do not filter, otherwise the card could never show.
+    if (raw.empty() && g_playersOnly.load() && bactro::health::playerCount() > 0) return;
 
     const auto now = std::chrono::steady_clock::now();
     if (logBudget())
@@ -383,11 +386,9 @@ void noteAttack(void* target, int slot) {
                                  kAttackNames[slot], target);
         return;
     }
-    if (logBudget()) logLine("TargetHUD: attack via %s target=%p", kAttackNames[slot], target);
-    try {
-        applyTarget(target, true);
-    } catch (...) {
-    }
+    // Debug only: proves the attack body hook fires. The card itself comes from the packet path
+    // (exact runtime id); the native getNameTag signature matches 3 places on 1.26.51.1, so it is not called here.
+    if (logBudget()) logLine("TargetHUD: native attack via %s target=%p", kAttackNames[slot], target);
 }
 
 template <int Slot>
@@ -402,9 +403,9 @@ void tryInstallAttackHooks() {
         SignatureId id;
         void* detour;
     };
-    // Only the Internal function has a real prologue. GameModeAttack / SurvivalModeAttack are
-    // 12-16 byte tail-call stubs: an inline hook there crashed the game on the first hit
-    // (1.26.51.x), so they are intentionally NOT hooked. Hits come from packets instead.
+    // Hook the body @0xf89f6c0 (1.26.51.1), never the stubs: GameMode::attack (slot 16) is
+    // `mov x3,x2; mov w2,#1; b <next insn>` (12 bytes) and hooking it crashed the game. SurvivalMode::attack
+    // jumps into the same body, so this one hook covers both. Off by default (debug logging only).
     const Entry entries[1] = {
         {2, SignatureId::GameModeAttackInternal, reinterpret_cast<void*>(&attackDetour<2>)},
     };
@@ -697,6 +698,11 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
         if (key == "showOnLook") g_showOnLook.store(value == "true" || value == "1");
         else if (key == "showOnHit") g_showOnHit.store(value == "true" || value == "1");
         else if (key == "playersOnly") g_playersOnly.store(value == "true" || value == "1");
+        else if (key == "nativeAttack") {
+            const bool on = value == "true" || value == "1";
+            g_nativeAttack.store(on);
+            if (on) tryInstallAttackHooks();
+        }
         else if (key == "liveTime") g_liveTime.store(std::stof(std::string(value)));
         else if (key == "lookRange") g_lookRange.store(std::stof(std::string(value)));
         else if (key == "scale") g_scale.store(std::stof(std::string(value)));
@@ -717,6 +723,7 @@ void registerModule() {
     b.config("showOnHit", "Show on hit", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("showOnLook", "Show when looking (3m)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("playersOnly", "Players only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("nativeAttack", "Log native attacks (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("liveTime", "Visible time (s)", pl::modmenu::ConfigType::SliderFloat, "5", "1", "15", "");
     b.config("lookRange", "Look range", pl::modmenu::ConfigType::SliderFloat, "3", "1", "8", "");
     b.config("scale", "Scale", pl::modmenu::ConfigType::SliderFloat, "1", "0.5", "2", "");
@@ -730,7 +737,7 @@ void registerModule() {
 void onSignaturesReady() {
     resolveActorFns();
     logLine("TargetHUD: getNameTag=%s isPlayer=%s", g_getNameTag ? "ok" : "MISSING", g_isPlayer ? "ok" : "MISSING");
-    tryInstallAttackHooks();
+    if (g_nativeAttack.load()) tryInstallAttackHooks();
 }
 
 void onFrame() {
@@ -740,7 +747,10 @@ void onFrame() {
         s_first = false;
         logLine("TargetHUD: onFrame running (NormalTick alive)");
     }
-    for (uint64_t rid; bactro::health::popHurt(rid);) applyRuntimeTarget(rid);
+    // Hits come from OUR outgoing attack packets (exact target runtime id). Incoming hurt events are ignored
+    // for target selection so other people's fights nearby don't steal the card.
+    for (uint64_t rid; bactro::health::popMyHit(rid);) applyRuntimeTarget(rid);
+    for (uint64_t drop; bactro::health::popHurt(drop);) {}
     syncPacketHealth();
     tickAnim();
     submitHud();

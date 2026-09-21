@@ -133,6 +133,7 @@ enum class SignatureId : std::uint16_t {
     ContainerScreenControllerHandleAutoPlace,
     ActorGetOffhandSlot,
     RenderPotionEffects,
+    CompressedPeerReceive,
     Count
 };
 

@@ -210,51 +210,80 @@ bool installTickHook() {
     return true;
 }
 
-// ---- NetworkPeerReceive (CompressedNetworkPeer @ 0xc6cf920 on 1.26.51.1) ----
-// 1.3.7 proved status==0 NEVER fires; many returns are garbage (-482394104) → wrong
-// ABI assumption on the return value. The std::string& still gets filled, so we parse
-// whenever the buffer is non-empty. TargetHUD also has a native attack hook as the
-// primary "show card on hit" path; packets improve HP when id 29 is present.
-using NetworkPeerReceiveFn = std::uintptr_t (*)(void* self, std::string& data, int a2, int a3);
-NetworkPeerReceiveFn g_netRecvOriginal = nullptr;
-bool g_netRecvHooked = false;
+// ---- CompressedNetworkPeer hooks (1.26.51.1, verified against libminecraftpe.so) ----
+// SignatureId::NetworkPeerReceive is really sendPacket (vtable slot 2 @0xc6cf920): it sees OUTGOING
+// batches (Login, PlayerAuthInput, InventoryTransaction...). SignatureId::CompressedPeerReceive is the
+// real receivePacket (slot 9 @0xc6cff78): after it returns 0, `out` holds an INCOMING decompressed batch.
+// Both detours forward every argument register untouched (unknown arity beyond x1).
+using PeerSendFn = std::uintptr_t (*)(void*, void*, void*, void*, void*, void*);
+using PeerRecvFn = std::uintptr_t (*)(void*, void*, void*, void*);
+PeerSendFn g_peerSendOrig = nullptr;
+PeerRecvFn g_peerRecvOrig = nullptr;
+bool g_peerSendHooked = false;
+bool g_peerRecvHooked = false;
 
-std::uintptr_t networkPeerReceiveDetour(void* self, std::string& data, int a2, int a3) {
-    const std::uintptr_t status =
-        g_netRecvOriginal ? g_netRecvOriginal(self, data, a2, a3) : 0;
-
-    {
-        static int s_log = 0;
-        if (s_log < 8) {
-            char b[120];
-            std::snprintf(b, sizeof(b), "net: ret=%ld size=%zu", (long)status, data.size());
-            writeStatus(b);
-            ++s_log;
+std::uintptr_t peerSendDetour(void* self, void* data, void* a2, void* a3, void* a4, void* a5) {
+    if (data) {
+        const auto* s = static_cast<const std::string*>(data);
+        if (!s->empty()) {
+            bactro::health::onOutgoingBatch(reinterpret_cast<const uint8_t*>(s->data()), s->size());
         }
     }
-
-    // Parse any non-empty buffer. HealthCache only acts on known packet ids (11/12/27/29).
-    if (!data.empty() && data.size() < (1u << 22)) {
-        bactro::health::onRawGamePacket(
-            reinterpret_cast<const uint8_t*>(data.data()), data.size());
-    }
-    return status;
+    return g_peerSendOrig ? g_peerSendOrig(self, data, a2, a3, a4, a5) : 0;
 }
 
-bool installNetworkPeerReceiveHook() {
-    if (g_netRecvHooked) return true;
-    void* o = nullptr;
-    if (!bactro::memory::hook(SignatureId::NetworkPeerReceive,
-                              reinterpret_cast<void*>(&networkPeerReceiveDetour), &o)) {
-        LOGE("NetworkPeerReceive hook failed");
-        writeStatus("NetworkPeerReceive HOOK FAIL");
-        return false;
+std::uintptr_t peerRecvDetour(void* self, void* out, void* a2, void* a3) {
+    const std::uintptr_t ret = g_peerRecvOrig ? g_peerRecvOrig(self, out, a2, a3) : 1;
+    if (out) {
+        const auto* s = static_cast<const std::string*>(out);
+        const size_t n = s->size();
+        if (n > 0 && n < (1u << 22)) {
+            // Return convention is assumed (0 == data), not proven: parse on 0, and also when the buffer
+            // content changed since the last parse. Parsing is idempotent, so a repeat is harmless.
+            static std::uint64_t lastFp = 0;
+            std::uint64_t fp = 1469598103934665603ull ^ n;
+            const auto* d = reinterpret_cast<const uint8_t*>(s->data());
+            for (size_t i = 0; i < n && i < 48; ++i) fp = (fp ^ d[i]) * 1099511628211ull;
+            const bool ok = static_cast<std::uint32_t>(ret) == 0;
+            if (ok || fp != lastFp) {
+                lastFp = fp;
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 6) {
+                    char b[96];
+                    std::snprintf(b, sizeof(b), "in: receive ret=%d size=%zu", static_cast<int>(ret), n);
+                    writeStatus(b);
+                }
+                bactro::health::onRawGamePacket(d, n);
+            }
+        }
     }
-    g_netRecvOriginal = reinterpret_cast<NetworkPeerReceiveFn>(o);
-    g_netRecvHooked = true;
-    LOGI("NetworkPeerReceive hooked (parse non-empty buffers)");
-    writeStatus("NetworkPeerReceive OK (parse non-empty)");
-    return true;
+    return ret;
+}
+
+bool installPeerHooks() {
+    if (!g_peerSendHooked) {
+        void* o = nullptr;
+        if (bactro::memory::hook(SignatureId::NetworkPeerReceive, reinterpret_cast<void*>(&peerSendDetour), &o)) {
+            g_peerSendOrig = reinterpret_cast<PeerSendFn>(o);
+            g_peerSendHooked = true;
+            LOGI("peer sendPacket hooked");
+            writeStatus("peer SEND hook OK");
+        } else {
+            writeStatus("peer SEND hook FAIL");
+        }
+    }
+    if (!g_peerRecvHooked) {
+        void* o = nullptr;
+        if (bactro::memory::hook(SignatureId::CompressedPeerReceive, reinterpret_cast<void*>(&peerRecvDetour), &o)) {
+            g_peerRecvOrig = reinterpret_cast<PeerRecvFn>(o);
+            g_peerRecvHooked = true;
+            LOGI("peer receivePacket hooked");
+            writeStatus("peer RECV hook OK");
+        } else {
+            writeStatus("peer RECV hook FAIL (signature missing or already hooked)");
+        }
+    }
+    return g_peerSendHooked || g_peerRecvHooked;
 }
 
 // ---- Fast Containers ----
@@ -397,9 +426,10 @@ void resolveEverythingAsync() {
         }
 
         {
-            const auto nr = bactro::memory::resolve(SignatureId::NetworkPeerReceive);
-            char buf[96];
-            std::snprintf(buf, sizeof(buf), "NetworkPeerReceive @ %p", reinterpret_cast<void*>(nr));
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "peer send @ %p recv @ %p",
+                          reinterpret_cast<void*>(bactro::memory::resolve(SignatureId::NetworkPeerReceive)),
+                          reinterpret_cast<void*>(bactro::memory::resolve(SignatureId::CompressedPeerReceive)));
             LOGI("%s", buf);
             writeStatus(buf);
         }
@@ -410,8 +440,8 @@ void resolveEverythingAsync() {
             installTickHook();
         // TargetHUD needs NormalTick for draw; ensure tick hook even if perf off
         installTickHook();
-        // Packet HP for TargetHUD (UpdateAttributes via CompressedNetworkPeer)
-        installNetworkPeerReceiveHook();
+        // TargetHUD data: outgoing attacks + incoming names/health (CompressedNetworkPeer)
+        installPeerHooks();
         bactro::targethud::onSignaturesReady();
         writeStatus("async init finished");
     }).detach();

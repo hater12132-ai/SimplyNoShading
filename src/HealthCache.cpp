@@ -24,6 +24,7 @@ bool g_hasLast = false;
 std::unordered_map<uint64_t, std::string> g_names;
 uint64_t g_self = 0;
 std::vector<uint64_t> g_hurt;
+std::vector<uint64_t> g_myHit;
 int g_seenMask = 0; // which packet ids we already logged once
 
 void logOnce(int bit, const char* what) {
@@ -33,6 +34,11 @@ void logOnce(int bit, const char* what) {
         g_seenMask |= (1 << bit);
     }
     bactro::statusLine(what);
+}
+
+void pushMyHit(uint64_t id) {
+    std::lock_guard lock(g_mu);
+    if (g_myHit.size() < 32) g_myHit.push_back(id);
 }
 
 void pushHurt(uint64_t id) {
@@ -223,36 +229,56 @@ void dispatchPacket(const uint8_t* d, size_t n) {
         }
         if (fresh) {
             char b[96];
-            std::snprintf(b, sizeof(b), "net: new packet id=%u len=%zu", id, n);
+            std::snprintf(b, sizeof(b), "in: new packet id=%u len=%zu", id, n);
             bactro::statusLine(b);
         }
     }
     switch (id) {
-    case 11:
-        logOnce(2, "pkt StartGame seen (server→client path OK)");
-        parseStartGame(r);
-        break;
-    case 12:
-        logOnce(5, "pkt AddPlayer seen");
-        parseAddPlayer(r);
-        break;
-    case 27:
-        parseActorEvent(r);
-        break;
+    case 11: parseStartGame(r); break;
+    case 12: parseAddPlayer(r); break;
+    case 27: parseActorEvent(r); break;
     case 29:
         logOnce(4, "pkt UpdateAttributes seen");
         parseUpdateAttributesPayload(r);
         break;
-    // Common primarily-client→server IDs. If these dominate with no 11/12/29,
-    // the hooked function is almost certainly SEND, not receive.
-    case 30:
-    case 33:
-    case 36:
-        logOnce(6, "pkt id 30/33/36 (client→server style) — if ONLY these, hook is SEND");
-        break;
-    default:
-        break;
+    default: break;
     }
+}
+
+// ---- outgoing (our own packets) ----
+// InventoryTransaction (id 30), ItemUseOnEntity (type 3), action Attack (1):
+//   varint32 legacyRequestId(0), varuint32 type, varuint32 actionCount(0),
+//   varuint64 targetRuntimeId, varuint32 actionType, ...
+void parseOutInventoryTransaction(const uint8_t* whole, size_t wholeLen, Reader r) {
+    static std::atomic<int> dumped{0};
+    const bool dump = dumped.fetch_add(1) < 6;
+    bool hit = false;
+    uint64_t rid = 0;
+    uint32_t req = 0, type = 0, n = 0, act = 0;
+    if (r.readVarU32(req) && req == 0 && r.readVarU32(type) && type == 3 && r.readVarU32(n) && n == 0 &&
+        r.readVarU64(rid) && r.readVarU32(act) && act == 1) {
+        hit = true;
+        pushMyHit(rid);
+    }
+    if (dump || hit) {
+        static std::atomic<int> hitLogs{0};
+        if (!hit || hitLogs.fetch_add(1) < 20) {
+            char b[240];
+            int o = std::snprintf(b, sizeof(b), "out: InvTx len=%zu type=%u hit=%d rid=%llu:", wholeLen, type,
+                                  hit ? 1 : 0, (unsigned long long)rid);
+            for (size_t i = 0; i < wholeLen && i < 22 && o < (int)sizeof(b) - 4; ++i)
+                o += std::snprintf(b + o, sizeof(b) - o, " %02x", whole[i]);
+            bactro::statusLine(b);
+        }
+    }
+}
+
+void dispatchOutPacket(const uint8_t* d, size_t n) {
+    if (!d || n < 1) return;
+    Reader r{d, d + n};
+    uint32_t id = 0;
+    if (!readHeader(r, id)) return;
+    if (id == 30) parseOutInventoryTransaction(d, n, r);
 }
 
 // Preferred: buffer is a batch [varuint len][packet]... that partitions exactly.
@@ -271,7 +297,7 @@ bool parseBatch(const uint8_t* data, size_t size) {
     }
     if (pk.empty()) return false;
     for (const auto& s : pk) dispatchPacket(s.p, s.n);
-    logOnce(0, "net: buffers parse as length-prefixed batches");
+    logOnce(0, "in: buffers parse as length-prefixed batches");
     return true;
 }
 
@@ -293,14 +319,14 @@ void onRawGamePacket(const uint8_t* data, size_t size) {
         const int k = dumps.fetch_add(1);
         if (k < 5 || (k == 200) || (k == 2000)) {
             char b[200];
-            int o = std::snprintf(b, sizeof(b), "net: buf#%d size=%zu:", k, size);
+            int o = std::snprintf(b, sizeof(b), "in: buf#%d size=%zu:", k, size);
             for (size_t i = 0; i < size && i < 16 && o < (int)sizeof(b) - 4; ++i)
                 o += std::snprintf(b + o, sizeof(b) - o, " %02x", data[i]);
             bactro::statusLine(b);
         }
     }
     if (parseBatch(data, size)) return;
-    logOnce(1, "net: buffer is NOT a clean batch (fallback scan for id 29 only)");
+    logOnce(1, "in: buffer is NOT a clean batch (fallback scan for id 29 only)");
     tryParseOne(data, size);
     if (size > 16) {
         for (size_t i = 0; i + 8 < size && i < size - 8; ++i) {
@@ -308,6 +334,29 @@ void onRawGamePacket(const uint8_t* data, size_t size) {
             if ((b & 0x3F) == 29 || b == 29) tryParseOne(data + i, size - i);
         }
     }
+}
+
+void onOutgoingBatch(const uint8_t* data, size_t size) {
+    if (!data || size < 2 || size > 1 << 22) return;
+    Reader r{data, data + size};
+    struct Span { const uint8_t* p; size_t n; };
+    Span pk[64];
+    size_t cnt = 0;
+    while (r.ok()) {
+        uint32_t len = 0;
+        if (!r.readVarU32(len) || len == 0 || len > r.left() || cnt >= 64) return; // not a clean batch
+        pk[cnt++] = {r.p, len};
+        r.p += len;
+    }
+    for (size_t i = 0; i < cnt; ++i) dispatchOutPacket(pk[i].p, pk[i].n);
+}
+
+bool popMyHit(uint64_t& runtimeId) {
+    std::lock_guard lock(g_mu);
+    if (g_myHit.empty()) return false;
+    runtimeId = g_myHit.front();
+    g_myHit.erase(g_myHit.begin());
+    return true;
 }
 
 void setHealth(uint64_t runtimeId, float current, float max, float absorption) {
@@ -344,7 +393,13 @@ void clear() {
     g_map.clear();
     g_names.clear();
     g_hurt.clear();
+    g_myHit.clear();
     g_hasLast = false;
+}
+
+size_t playerCount() {
+    std::lock_guard lock(g_mu);
+    return g_names.size();
 }
 
 std::string playerName(uint64_t runtimeId) {
