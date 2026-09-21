@@ -107,20 +107,13 @@ bool readHeader(Reader& r, uint32_t& packetId) {
     return true;
 }
 
-// AttributeData (1.26.x / Endstone r26_u5):
-// min, max, current, defaultMin, defaultMax, default, name, modifiers[]
-bool parseAttribute(Reader& r, std::string& name, float& minV, float& maxV, float& cur) {
-    float dMin, dMax, def;
-    if (!r.readF32(minV) || !r.readF32(maxV) || !r.readF32(cur)) return false;
-    if (!r.readF32(dMin) || !r.readF32(dMax) || !r.readF32(def)) return false;
-    if (!r.readString(name)) return false;
+// Skip AttributeModifier list (shared by all layouts).
+bool skipModifiers(Reader& r) {
     uint32_t modCount = 0;
     if (!r.readVarU32(modCount)) return false;
-    // skip modifiers: string id, string name, f32 amount, i32 op, i32 operand, bool
     for (uint32_t i = 0; i < modCount && i < 64; ++i) {
         std::string id, n;
         float amount;
-        // i32 as 4 bytes LE
         if (!r.readString(id) || !r.readString(n) || !r.readF32(amount)) return false;
         if (r.left() < 4 + 4 + 1) return false;
         r.p += 4 + 4; // op + operand
@@ -130,26 +123,116 @@ bool parseAttribute(Reader& r, std::string& name, float& minV, float& maxV, floa
     return true;
 }
 
+// Modern Bedrock (1.19+ / 1.26): name, min, max, current, default, modifiers[]
+bool parseAttributeNameFirst(Reader& r, std::string& name, float& minV, float& maxV, float& cur) {
+    float def;
+    if (!r.readString(name)) return false;
+    if (!r.readF32(minV) || !r.readF32(maxV) || !r.readF32(cur) || !r.readF32(def)) return false;
+    return skipModifiers(r);
+}
+
+// Older: min, max, current, default, name, modifiers[]
+bool parseAttributeFloat4(Reader& r, std::string& name, float& minV, float& maxV, float& cur) {
+    float def;
+    if (!r.readF32(minV) || !r.readF32(maxV) || !r.readF32(cur) || !r.readF32(def)) return false;
+    if (!r.readString(name)) return false;
+    return skipModifiers(r);
+}
+
+// Endstone-style: min, max, current, defaultMin, defaultMax, default, name, modifiers[]
+bool parseAttributeFloat6(Reader& r, std::string& name, float& minV, float& maxV, float& cur) {
+    float dMin, dMax, def;
+    if (!r.readF32(minV) || !r.readF32(maxV) || !r.readF32(cur)) return false;
+    if (!r.readF32(dMin) || !r.readF32(dMax) || !r.readF32(def)) return false;
+    if (!r.readString(name)) return false;
+    return skipModifiers(r);
+}
+
+using AttrParser = bool (*)(Reader&, std::string&, float&, float&, float&);
+
+bool tryParseAttributes(Reader base, AttrParser parser, float& healthCur, float& healthMax, float& absorp,
+                        int& parsed, std::string& firstName) {
+    uint32_t count = 0;
+    if (!base.readVarU32(count) || count == 0 || count > 64) return false;
+    healthCur = healthMax = absorp = -1.f;
+    parsed = 0;
+    firstName.clear();
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string name;
+        float mn, mx, cur;
+        if (!parser(base, name, mn, mx, cur)) return false;
+        if (firstName.empty()) firstName = name;
+        ++parsed;
+        if (name == "minecraft:health" || name == "health") {
+            healthCur = cur;
+            healthMax = mx;
+        } else if (name == "minecraft:absorption" || name == "absorption" ||
+                   name == "minecraft:player.absorption") {
+            absorp = cur;
+        }
+    }
+    return healthCur >= 0.f || absorp >= 0.f || parsed > 0;
+}
+
 void parseUpdateAttributesPayload(Reader& r) {
     // After packet header already consumed
     uint64_t runtimeId = 0;
     if (!r.readVarU64(runtimeId)) return;
 
-    uint32_t count = 0;
-    if (!r.readVarU32(count) || count > 64) return;
+    // Snapshot so we can retry alternate layouts
+    const uint8_t* save = r.p;
+    const size_t saveLeft = r.left();
 
     float healthCur = -1.f, healthMax = -1.f, absorp = -1.f;
-    for (uint32_t i = 0; i < count; ++i) {
-        std::string name;
-        float mn, mx, cur;
-        if (!parseAttribute(r, name, mn, mx, cur)) break;
-        if (name == "minecraft:health" || name == "health") {
-            healthCur = cur;
-            healthMax = mx;
-        } else if (name == "minecraft:absorption" || name == "absorption") {
-            absorp = cur;
+    int parsed = 0;
+    std::string firstName;
+    const char* layout = "none";
+
+    struct Try {
+        AttrParser fn;
+        const char* name;
+    };
+    const Try tries[] = {
+        {&parseAttributeNameFirst, "name-first"},
+        {&parseAttributeFloat4, "float4"},
+        {&parseAttributeFloat6, "float6"},
+    };
+    for (const auto& t : tries) {
+        Reader trial{save, save + saveLeft};
+        float hc = -1.f, hm = -1.f, ab = -1.f;
+        int n = 0;
+        std::string fn;
+        if (tryParseAttributes(trial, t.fn, hc, hm, ab, n, fn) && (hc >= 0.f || ab >= 0.f)) {
+            healthCur = hc;
+            healthMax = hm;
+            absorp = ab;
+            parsed = n;
+            firstName = fn;
+            layout = t.name;
+            r.p = trial.p; // consume
+            break;
+        }
+        // Keep best partial for diagnostics
+        if (n > parsed) {
+            parsed = n;
+            firstName = fn;
+            layout = t.name;
         }
     }
+
+    {
+        static int s_uaLog = 0;
+        if (s_uaLog < 12) {
+            char b[160];
+            std::snprintf(b, sizeof(b),
+                          "UA rid=%llu layout=%s attrs=%d first=%.24s hp=%.1f/%.1f abs=%.1f",
+                          (unsigned long long)runtimeId, layout, parsed,
+                          firstName.empty() ? "-" : firstName.c_str(), healthCur, healthMax, absorp);
+            bactro::statusLine(b);
+            ++s_uaLog;
+        }
+    }
+
     if (healthCur < 0.f && absorp < 0.f) return;
 
     EntityHealth h{};
@@ -374,9 +457,13 @@ void setHealth(uint64_t runtimeId, float current, float max, float absorption) {
     g_lastHealth = e;
     g_hasLast = true;
     static int s_log;
-    if ((++s_log % 8) == 1)
-        HC_LOGI("packet HP runtime=%llu cur=%.1f max=%.1f abs=%.1f",
-                (unsigned long long)runtimeId, current, e.max, absorption);
+    if ((++s_log % 4) == 1) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "packet HP runtime=%llu cur=%.1f max=%.1f abs=%.1f",
+                      (unsigned long long)runtimeId, current, e.max, absorption);
+        bactro::statusLine(b);
+        HC_LOGI("%s", b);
+    }
 }
 
 std::optional<EntityHealth> get(uint64_t runtimeId) {
