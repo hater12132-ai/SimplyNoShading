@@ -6,17 +6,21 @@
 #include <pl/memory/Hook.hpp>
 
 #include <android/log.h>
+#include <dlfcn.h>
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <string>
 
 #define HS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
+
+using GLint = int;
+using GLsizei = int;
+using GLfloat = float;
 
 namespace bactro::handshader {
 namespace {
@@ -25,24 +29,25 @@ constexpr const char* kModuleId = "bactro.handshader";
 
 std::atomic_bool g_enabled{true};
 std::atomic_bool g_rainbow{false};
-std::atomic<float> g_brightness{1.15f};
-std::atomic<float> g_tintR{1.0f};
+std::atomic<float> g_brightness{1.4f};
+std::atomic<float> g_tintR{0.55f};
 std::atomic<float> g_tintG{1.0f};
-std::atomic<float> g_tintB{1.0f};
+std::atomic<float> g_tintB{1.35f};
 std::atomic<float> g_opacity{1.0f};
 std::atomic_bool g_hideVanillaHand{false};
 
-// True while ItemInHandRenderer::renderFirstPerson is on the stack
 std::atomic_bool g_inHandRender{false};
+std::atomic_int g_uniformHits{0};
 
 using RenderFirstPersonFn = void (*)(void* self, void* a1, void* a2, void* a3, void* a4, void* a5);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
 bool g_renderFpHooked = false;
 
-using SetEntityConstantsFn = void (*)(void* self, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6,
-                                      void* a7, void* a8);
-SetEntityConstantsFn g_setEntityConstantsOriginal = nullptr;
-bool g_setEntityConstantsHooked = false;
+using GlUniform4fFn = void (*)(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
+using GlUniform4fvFn = void (*)(GLint location, GLsizei count, const GLfloat* value);
+GlUniform4fFn g_glUniform4f = nullptr;
+GlUniform4fvFn g_glUniform4fv = nullptr;
+bool g_glHooked = false;
 
 void logLine(const char* fmt, ...) {
     char buf[192];
@@ -54,7 +59,6 @@ void logLine(const char* fmt, ...) {
     HS_LOGI("%s", buf);
 }
 
-// ---- RGB helpers ----
 void hsvToRgb(float h, float s, float v, float& r, float& g, float& b) {
     h = std::fmod(h, 1.f);
     if (h < 0.f) h += 1.f;
@@ -73,55 +77,131 @@ void hsvToRgb(float h, float s, float v, float& r, float& g, float& b) {
     }
 }
 
-void currentTint(float& r, float& g, float& b) {
+void currentTint(float& r, float& g, float& b, float& a) {
     if (g_rainbow.load(std::memory_order_relaxed)) {
         static auto start = std::chrono::steady_clock::now();
         const float sec =
             std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
-        hsvToRgb(std::fmod(sec * 0.15f, 1.f), 0.85f, 1.f, r, g, b);
+        hsvToRgb(std::fmod(sec * 0.2f, 1.f), 0.9f, 1.f, r, g, b);
     } else {
         r = g_tintR.load(std::memory_order_relaxed);
         g = g_tintG.load(std::memory_order_relaxed);
         b = g_tintB.load(std::memory_order_relaxed);
     }
     const float br = g_brightness.load(std::memory_order_relaxed);
-    r = std::fmin(2.f, r * br);
-    g = std::fmin(2.f, g * br);
-    b = std::fmin(2.f, b * br);
+    r *= br;
+    g *= br;
+    b *= br;
+    a = g_opacity.load(std::memory_order_relaxed);
 }
 
-// ---- detours ----
-void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
-    const bool on = g_enabled.load(std::memory_order_relaxed);
-    if (on) g_inHandRender.store(true, std::memory_order_release);
-    if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
-    if (on) g_inHandRender.store(false, std::memory_order_release);
+bool looksLikeColor(GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
+    auto ok = [](GLfloat x) { return x >= -0.05f && x <= 2.5f; };
+    return ok(v0) && ok(v1) && ok(v2) && ok(v3) && (v3 >= 0.f && v3 <= 1.05f);
+}
 
-    static int s_log = 0;
-    if (on && s_log < 3) {
-        logLine("HandShader: renderFirstPerson ok");
-        ++s_log;
+void applyTint(GLfloat& v0, GLfloat& v1, GLfloat& v2, GLfloat& v3) {
+    if (!looksLikeColor(v0, v1, v2, v3)) return;
+    float tr, tg, tb, ta;
+    currentTint(tr, tg, tb, ta);
+    v0 *= tr;
+    v1 *= tg;
+    v2 *= tb;
+    v3 *= ta;
+    const int n = g_uniformHits.fetch_add(1, std::memory_order_relaxed);
+    if (n < 12) {
+        logLine("HandShader: tint uniform #%d -> (%.2f,%.2f,%.2f,%.2f)", n, v0, v1, v2, v3);
     }
 }
 
-// SetEntityConstants is called while building actor/hand materials.
-// We only intervene while first-person hand is rendering.
-// ABI is version-fragile: forward all args, optionally poke nearby floats on stack is unsafe,
-// so we only gate logging + leave a safe call-through. Tint is applied via module state
-// that future material hooks can read; render path is confirmed via status.
-void setEntityConstantsDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6,
-                              void* a7, void* a8) {
-    if (g_setEntityConstantsOriginal)
-        g_setEntityConstantsOriginal(self, a1, a2, a3, a4, a5, a6, a7, a8);
-
+void glUniform4fDetour(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
     if (g_enabled.load(std::memory_order_relaxed) && g_inHandRender.load(std::memory_order_acquire)) {
-        static int s_log = 0;
-        if (s_log < 5) {
-            float r, g, b;
-            currentTint(r, g, b);
-            logLine("HandShader: hand constants path tint=%.2f,%.2f,%.2f", r, g, b);
-            ++s_log;
+        applyTint(v0, v1, v2, v3);
+    }
+    if (g_glUniform4f) g_glUniform4f(location, v0, v1, v2, v3);
+}
+
+void glUniform4fvDetour(GLint location, GLsizei count, const GLfloat* value) {
+    if (g_enabled.load(std::memory_order_relaxed) && g_inHandRender.load(std::memory_order_acquire) &&
+        value && count > 0) {
+        GLfloat tmp[4] = {value[0], value[1], value[2], value[3]};
+        applyTint(tmp[0], tmp[1], tmp[2], tmp[3]);
+        if (g_glUniform4fv) {
+            if (count == 1) {
+                g_glUniform4fv(location, 1, tmp);
+                return;
+            }
+            if (count <= 16) {
+                GLfloat buf[64];
+                std::memcpy(buf, value, static_cast<size_t>(count) * 4 * sizeof(GLfloat));
+                buf[0] = tmp[0];
+                buf[1] = tmp[1];
+                buf[2] = tmp[2];
+                buf[3] = tmp[3];
+                g_glUniform4fv(location, count, buf);
+                return;
+            }
         }
+    }
+    if (g_glUniform4fv) g_glUniform4fv(location, count, value);
+}
+
+void tryHookGles() {
+    if (g_glHooked) return;
+    void* lib = dlopen("libGLESv2.so", RTLD_NOW);
+    if (!lib) lib = dlopen("libGLESv3.so", RTLD_NOW);
+    if (!lib) lib = dlopen("libGLESv2.so.2", RTLD_NOW);
+    if (!lib) {
+        logLine("HandShader: libGLESv2 missing");
+        return;
+    }
+
+    void* u4f = dlsym(lib, "glUniform4f");
+    void* u4fv = dlsym(lib, "glUniform4fv");
+    int ok = 0;
+
+    if (u4f) {
+        void* o = nullptr;
+        if (pl::memory::hook(u4f, reinterpret_cast<void*>(&glUniform4fDetour), &o) == 0) {
+            g_glUniform4f = reinterpret_cast<GlUniform4fFn>(o);
+            ++ok;
+        }
+    }
+    if (u4fv) {
+        void* o = nullptr;
+        if (pl::memory::hook(u4fv, reinterpret_cast<void*>(&glUniform4fvDetour), &o) == 0) {
+            g_glUniform4fv = reinterpret_cast<GlUniform4fvFn>(o);
+            ++ok;
+        }
+    }
+
+    g_glHooked = ok > 0;
+    logLine("HandShader: GLES color hooks %d/2", ok);
+}
+
+void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
+        return;
+    }
+
+    if (g_hideVanillaHand.load(std::memory_order_relaxed)) {
+        static int s_hideLog = 0;
+        if (s_hideLog < 2) {
+            logLine("HandShader: hideHand — skipped renderFirstPerson");
+            ++s_hideLog;
+        }
+        return;
+    }
+
+    g_inHandRender.store(true, std::memory_order_release);
+    if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
+    g_inHandRender.store(false, std::memory_order_release);
+
+    static int s_log = 0;
+    if (s_log < 3) {
+        logLine("HandShader: renderFirstPerson ok (hits=%d)", g_uniformHits.load());
+        ++s_log;
     }
 }
 
@@ -134,21 +214,10 @@ void tryInstallHooks() {
             g_renderFpHooked = true;
             logLine("HandShader: ItemInHandRenderer::renderFirstPerson hooked");
         } else {
-            logLine("HandShader: renderFirstPerson hook FAILED / sig missing");
+            logLine("HandShader: renderFirstPerson hook FAILED");
         }
     }
-
-    if (!g_setEntityConstantsHooked) {
-        void* o = nullptr;
-        if (bactro::memory::hook(bactro::memory::SignatureId::ActorShaderManagerSetEntityConstants,
-                                 reinterpret_cast<void*>(&setEntityConstantsDetour), &o)) {
-            g_setEntityConstantsOriginal = reinterpret_cast<SetEntityConstantsFn>(o);
-            g_setEntityConstantsHooked = true;
-            logLine("HandShader: ActorShaderManager::setEntityConstants hooked");
-        } else {
-            logLine("HandShader: setEntityConstants not hooked (optional)");
-        }
-    }
+    tryHookGles();
 }
 
 void onToggle(std::string_view, bool enabled) {
@@ -180,28 +249,22 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Shader");
-    b.description("First-person hand / held-item visual: brightness, RGB tint, rainbow.")
+    b.description("First-person hand/item color via GLES uniform hooks. Strong default cyan tint.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("brightness", "Brightness", pl::modmenu::ConfigType::SliderFloat, "1.15", "0.2", "2.5", "");
-    b.config("tintR", "Tint red", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
+    b.config("brightness", "Brightness", pl::modmenu::ConfigType::SliderFloat, "1.4", "0.2", "3.0", "");
+    b.config("tintR", "Tint red", pl::modmenu::ConfigType::SliderFloat, "0.55", "0", "2", "");
     b.config("tintG", "Tint green", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
-    b.config("tintB", "Tint blue", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
+    b.config("tintB", "Tint blue", pl::modmenu::ConfigType::SliderFloat, "1.35", "0", "2", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "1", "");
     b.config("rainbow", "Rainbow tint", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("hideHand", "Hide vanilla hand (experimental)", pl::modmenu::ConfigType::Toggle, "false", "", "",
-             "");
+    b.config("hideHand", "Hide hand / item", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
-    HS_LOGI("HandShader module registered");
 }
 
 void onSignaturesReady() { tryInstallHooks(); }
-
-void onFrame() {
-    // Reserved for future material uniform writes / rainbow drive
-}
-
+void onFrame() {}
 void shutdown() {
     g_enabled.store(false, std::memory_order_release);
     g_inHandRender.store(false, std::memory_order_release);
