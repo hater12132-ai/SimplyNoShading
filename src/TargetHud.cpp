@@ -288,9 +288,9 @@ void applyTarget(void* actor, bool fromHit) {
         g_target.hurtFlash = fromHit ? 1.f : 0.f;
         g_target.hitCount = fromHit ? 1 : 0;
     } else if (fromHit) {
-        // BedrockTools-style estimate so the bar always reacts between attribute packets.
-        // When live packet HP is bound, the next UA packet will correct the value.
-        constexpr float kHitDmg = 1.0f; // ~1 heart per sword swing estimate
+        // Client estimate when server keeps broadcasting full HP for other players (Hive).
+        // Real UA damage (current < max) still wins via syncPacketHealth.
+        constexpr float kHitDmg = 2.0f;
         float remain = kHitDmg;
         if (g_target.absorption > 0.f) {
             const float used = std::min(g_target.absorption, remain);
@@ -340,16 +340,28 @@ void applyRuntimeTarget(uint64_t rid) {
         g_target.health = g_target.displayHealth = 20.f;
         g_target.maxHealth = 20.f;
         if (auto h = bactro::health::get(rid)) {
-            g_target.health = g_target.displayHealth = h->current;
             g_target.maxHealth = h->max > 0.f ? h->max : 20.f;
-            g_target.absorption = h->absorption;
-            g_target.liveHealth = true;
+            // Only trust packet if it already shows damage (Hive often sends 20/20 forever)
+            if (h->current < h->max - 0.25f || h->absorption > 0.05f) {
+                g_target.health = g_target.displayHealth = h->current;
+                g_target.absorption = h->absorption;
+                g_target.liveHealth = true;
+            }
         }
     } else {
         ++g_target.hitCount;
-        // Estimate damage on each hurt event until live UA corrects it
-        if (!g_target.liveHealth) {
-            constexpr float kHitDmg = 1.0f;
+        if (auto h = bactro::health::get(rid)) {
+            if (h->current < g_target.health - 0.05f || h->absorption > g_target.absorption + 0.05f ||
+                (h->max > 0.f && h->current < h->max - 0.25f && h->current < g_target.health + 0.01f)) {
+                g_target.health = h->current;
+                g_target.maxHealth = h->max > 0.f ? h->max : g_target.maxHealth;
+                g_target.absorption = h->absorption;
+                g_target.liveHealth = true;
+            }
+        }
+        // Hurt animation = someone took a hit: step estimate when packet still says full HP
+        if (!g_target.liveHealth || g_target.health >= g_target.maxHealth - 0.25f) {
+            constexpr float kHitDmg = 2.0f;
             float remain = kHitDmg;
             if (g_target.absorption > 0.f) {
                 const float used = std::min(g_target.absorption, remain);
@@ -357,17 +369,29 @@ void applyRuntimeTarget(uint64_t rid) {
                 remain -= used;
             }
             if (remain > 0.f) g_target.health = std::max(0.f, g_target.health - remain);
-        } else if (auto h = bactro::health::get(rid)) {
-            g_target.health = h->current;
-            g_target.maxHealth = h->max > 0.f ? h->max : g_target.maxHealth;
-            g_target.absorption = h->absorption;
         }
     }
 }
 
-// Pull ProtoHax-style packet HP into the active target.
-// 1) If we already bound a runtimeId, use HealthCache directly.
-// 2) Else, if we recently hit someone, bind the most recent health update (1v1).
+// Apply packet HP only when it is useful.
+// On Hive, UpdateAttributes for *other* players is often stuck at 20/20 forever while
+// YOUR own UA is real (log: self 9 → 3). Blindly overwriting every frame wiped hit
+// estimates and froze the bar at full HP. Trust packets when they show damage or change.
+bool shouldApplyPacketHp(float packetCur, float packetMax, float packetAbs, float curHp, float curAbs,
+                         bool alreadyLive) {
+    if (packetCur < 0.f) return false;
+    // Always accept a lower value (server confirmed damage)
+    if (packetCur < curHp - 0.05f) return true;
+    // Absorption change (gapple)
+    if (std::fabs(packetAbs - curAbs) > 0.05f) return true;
+    // Not full life — treat as authoritative snapshot
+    if (packetMax > 0.f && packetCur < packetMax - 0.25f) return true;
+    // First bind only if we have no estimate progress yet
+    if (!alreadyLive && curHp >= 19.5f) return true;
+    return false;
+}
+
+// Pull packet HP into the active target without clobbering better client estimates.
 void syncPacketHealth() {
     using clock = std::chrono::steady_clock;
     const auto now = clock::now();
@@ -375,32 +399,45 @@ void syncPacketHealth() {
     std::lock_guard lock(g_mutex);
     if (!g_target.valid || g_target.dead) return;
 
+    const uint64_t self = bactro::health::selfRuntimeId();
+
     if (g_target.runtimeId != 0) {
+        if (g_target.runtimeId == self) return; // never show self as target via packets
         if (auto h = bactro::health::get(g_target.runtimeId)) {
-            g_target.health = h->current;
-            g_target.maxHealth = h->max > 0.f ? h->max : g_target.maxHealth;
-            g_target.absorption = h->absorption;
-            g_target.liveHealth = true;
-            if (h->current <= 0.01f) {
-                g_target.dead = true;
-                g_target.diedAt = now;
+            if (shouldApplyPacketHp(h->current, h->max, h->absorption, g_target.health, g_target.absorption,
+                                    g_target.liveHealth)) {
+                g_target.health = h->current;
+                g_target.maxHealth = h->max > 0.f ? h->max : g_target.maxHealth;
+                g_target.absorption = h->absorption;
+                g_target.liveHealth = true;
+                if (h->current <= 0.01f) {
+                    g_target.dead = true;
+                    g_target.diedAt = now;
+                }
+            } else if (h->max > 0.f) {
+                g_target.maxHealth = h->max;
             }
         }
         return;
     }
 
-    // No runtimeId yet: bind most recent UpdateAttributes within 1.25s of a hit (1v1 PvP)
+    // No runtimeId yet: bind most recent NON-SELF health update within 1.25s of a hit (1v1)
     if (g_target.lastHit.time_since_epoch().count() == 0) return;
     const float sinceHit = std::chrono::duration<float>(now - g_target.lastHit).count();
     if (sinceHit > 1.25f) return;
 
     if (auto last = bactro::health::lastUpdate()) {
+        if (last->first == 0 || last->first == self) return;
         g_target.runtimeId = last->first;
-        g_target.health = last->second.current;
+        // Only snap HP from packet if it looks damaged; otherwise keep estimate progress
+        if (shouldApplyPacketHp(last->second.current, last->second.max, last->second.absorption,
+                                g_target.health, g_target.absorption, g_target.liveHealth)) {
+            g_target.health = last->second.current;
+            g_target.absorption = last->second.absorption;
+            g_target.liveHealth = true;
+        }
         g_target.maxHealth = last->second.max > 0.f ? last->second.max : 20.f;
-        g_target.absorption = last->second.absorption;
-        g_target.liveHealth = true;
-        if (last->second.current <= 0.01f) {
+        if (g_target.health <= 0.01f) {
             g_target.dead = true;
             g_target.diedAt = now;
         }
