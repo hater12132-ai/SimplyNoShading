@@ -1,6 +1,5 @@
 #include "bactro/Signatures.hpp"
-#include "bactro/TargetHud.hpp"
-#include "bactro/HealthCache.hpp"
+#include "bactro/HandShader.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
 
@@ -12,8 +11,6 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
-#include <time.h>
-#include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
@@ -31,8 +28,6 @@ namespace {
 
 using bactro::memory::SignatureId;
 
-// File heartbeat — Termux often cannot read Minecraft logcat on non-root Android.
-// Check with: cat /sdcard/Android/media/org.levimc.launcher/bactro_status.txt
 constexpr const char* kStatusPath =
     "/storage/emulated/0/Android/media/org.levimc.launcher/bactro_status.txt";
 constexpr const char* kStatusPathAlt =
@@ -58,9 +53,6 @@ void writeStatusReplace(const std::string& body) {
     }
 }
 
-// -------- Performance --------
-// IMPORTANT: do NOT hook eglSwapBuffers — that made LeviLauncher's FPS counter show 0.
-// Only force eglSwapInterval(0) and optionally re-apply from NormalTick.
 std::atomic_bool g_perfEnabled{true};
 std::atomic_bool g_unlockFps{true};
 std::atomic<float> g_fullbright{0.0f};
@@ -78,60 +70,20 @@ uint8_t g_fullbrightOriginal[12]{};
 bool g_fullbrightPatched = false;
 std::atomic_bool g_sigsReady{false};
 
-// -------- Fast Containers --------
-std::atomic_bool g_fastContainers{true};
-std::atomic_bool g_containerOpen{false};
-std::atomic_bool g_readyForNextOpen{true};
-std::atomic<int64_t> g_lastContainerCloseNs{0};
-
-struct InteractionResultValue {
-    std::uint8_t value{};
-};
-
-using UseItemOnFn = InteractionResultValue (*)(void*, void*, const void*, std::uint8_t, const void*, const void*, bool);
-using InteractFn = bool (*)(void*, void*, const void*);
-using ScreenFn = void* (*)(void*, void*, void*, void*, void*, void*, void*, void*);
-
-UseItemOnFn g_useOnGame = nullptr;
-UseItemOnFn g_useOnSurvival = nullptr;
-InteractFn g_interactGame = nullptr;
-InteractFn g_interactSurvival = nullptr;
-ScreenFn g_containerOpenOrig = nullptr;
-ScreenFn g_containerCloseOrig = nullptr;
-
-int64_t monoNs() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
-}
-
-bool wantsFastOpen() {
-    if (!g_fastContainers.load(std::memory_order_relaxed)) return false;
-    if (g_containerOpen.load(std::memory_order_acquire)) return false;
-    return g_readyForNextOpen.load(std::memory_order_acquire);
-}
-
-bool patchMemory(void* target, const void* data, size_t size) {
-    if (!target || !data || size == 0) return false;
-    const long pageSize = sysconf(_SC_PAGESIZE);
-    if (pageSize <= 0) return false;
-    const auto addr = reinterpret_cast<std::uintptr_t>(target);
-    const auto page = reinterpret_cast<void*>(addr & ~(static_cast<std::uintptr_t>(pageSize) - 1));
-    const size_t len = (addr + size) - reinterpret_cast<std::uintptr_t>(page) + static_cast<size_t>(pageSize);
-    if (mprotect(page, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-    std::memcpy(target, data, size);
-    __builtin___clear_cache(reinterpret_cast<char*>(target),
-                            reinterpret_cast<char*>(target) + size);
+bool patchMemory(void* addr, const void* src, size_t n) {
+    if (!addr || !src || n == 0) return false;
+    const auto page = reinterpret_cast<uintptr_t>(addr) & ~static_cast<uintptr_t>(0xFFF);
+    if (mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return false;
+    std::memcpy(addr, src, n);
+    __builtin___clear_cache(reinterpret_cast<char*>(addr), reinterpret_cast<char*>(addr) + n);
     return true;
 }
 
 void applyFullbrightPatch(bool enable) {
     if (!g_fullbrightTarget) return;
     if (enable && !g_fullbrightPatched) {
-        const uint8_t patch[12] = {
-            0x40, 0x8F, 0xA8, 0x52, 0x00, 0x00, 0x27, 0x1E, 0xC0, 0x03, 0x5F, 0xD6
-        };
-        if (patchMemory(g_fullbrightTarget, patch, sizeof(patch))) {
+        if (patchMemory(g_fullbrightTarget, g_fullbrightOriginal, 12)) {
             g_fullbrightPatched = true;
             LOGI("fullbright ON");
         }
@@ -144,29 +96,25 @@ void applyFullbrightPatch(bool enable) {
 }
 
 void syncFullbright() {
-    if (!g_sigsReady.load(std::memory_order_acquire)) return;
     applyFullbrightPatch(g_fullbright.load(std::memory_order_relaxed) >= 9.5f);
 }
 
-EGLBoolean swapIntervalDetour(EGLDisplay display, EGLint interval) {
-    if (g_perfEnabled.load(std::memory_order_relaxed) &&
-        g_unlockFps.load(std::memory_order_relaxed)) {
+EGLBoolean swapIntervalDetour(EGLDisplay d, EGLint interval) {
+    if (g_unlockFps.load(std::memory_order_relaxed) && g_perfEnabled.load(std::memory_order_relaxed))
         interval = 0;
-    }
-    return g_swapIntervalOriginal ? g_swapIntervalOriginal(display, interval) : EGL_FALSE;
+    return g_swapIntervalOriginal ? g_swapIntervalOriginal(d, interval) : eglSwapInterval(d, interval);
 }
 
 void normalTickDetour(void* self) {
     if (g_tickOriginal) g_tickOriginal(self);
-    if (g_perfEnabled.load(std::memory_order_relaxed) &&
-        g_unlockFps.load(std::memory_order_relaxed)) {
+    if (g_unlockFps.load(std::memory_order_relaxed) && g_perfEnabled.load(std::memory_order_relaxed)) {
         EGLDisplay d = eglGetCurrentDisplay();
         if (d != EGL_NO_DISPLAY) {
             if (g_swapIntervalOriginal) g_swapIntervalOriginal(d, 0);
             else eglSwapInterval(d, 0);
         }
     }
-    bactro::targethud::onFrame();
+    bactro::handshader::onFrame();
 }
 
 bool installSwapIntervalHook() {
@@ -174,24 +122,30 @@ bool installSwapIntervalHook() {
     void* egl = dlopen("libEGL.so", RTLD_NOW);
     if (!egl) egl = dlopen("libEGL.so.1", RTLD_NOW);
     if (!egl) {
-        LOGE("dlopen libEGL failed");
+        LOGE("libEGL missing");
+        writeStatus("eglSwapInterval FAIL no lib");
         return false;
     }
     void* sym = dlsym(egl, "eglSwapInterval");
     if (!sym) {
-        LOGE("eglSwapInterval missing");
+        writeStatus("eglSwapInterval FAIL no sym");
         return false;
     }
-    void* orig = nullptr;
-    if (pl::memory::hook(sym, reinterpret_cast<void*>(&swapIntervalDetour), &orig) != 0) {
+    void* o = nullptr;
+    if (pl::memory::hook(sym, reinterpret_cast<void*>(&swapIntervalDetour), &o) != 0) {
         LOGE("eglSwapInterval hook failed");
+        writeStatus("eglSwapInterval HOOK FAIL");
+        // Still force once
+        EGLDisplay d = eglGetCurrentDisplay();
+        if (d != EGL_NO_DISPLAY) eglSwapInterval(d, 0);
         return false;
     }
-    g_swapIntervalOriginal = reinterpret_cast<EglSwapIntervalFn>(orig);
+    g_swapIntervalOriginal = reinterpret_cast<EglSwapIntervalFn>(o);
     g_swapIntervalHooked = true;
     EGLDisplay d = eglGetCurrentDisplay();
-    if (d != EGL_NO_DISPLAY && g_swapIntervalOriginal) g_swapIntervalOriginal(d, 0);
-    LOGI("eglSwapInterval hooked (Levi FPS counter safe)");
+    if (d != EGL_NO_DISPLAY) swapIntervalDetour(d, 0);
+    LOGI("eglSwapInterval hooked");
+    writeStatus("eglSwapInterval OK");
     return true;
 }
 
@@ -199,250 +153,36 @@ bool installTickHook() {
     if (g_tickHooked) return true;
     void* o = nullptr;
     if (!bactro::memory::hook(SignatureId::NormalTick, reinterpret_cast<void*>(&normalTickDetour), &o)) {
-        LOGE("NormalTick hook failed (optional)");
-        writeStatus("NormalTick hook FAIL (TargetHUD cannot draw without it)");
+        writeStatus("NormalTick HOOK FAIL");
         return false;
     }
     g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
     g_tickHooked = true;
-    LOGI("NormalTick hooked");
     writeStatus("NormalTick hooked");
     return true;
 }
 
-// ---- CompressedNetworkPeer hooks (1.26.51.1, verified against libminecraftpe.so) ----
-// SignatureId::NetworkPeerReceive is really sendPacket (vtable slot 2 @0xc6cf920): it sees OUTGOING
-// batches (Login, PlayerAuthInput, InventoryTransaction...). SignatureId::CompressedPeerReceive is the
-// real receivePacket (slot 9 @0xc6cff78): after it returns 0, `out` holds an INCOMING decompressed batch.
-// Both detours forward every argument register untouched (unknown arity beyond x1).
-using PeerSendFn = std::uintptr_t (*)(void*, void*, void*, void*, void*, void*);
-using PeerRecvFn = std::uintptr_t (*)(void*, void*, void*, void*);
-PeerSendFn g_peerSendOrig = nullptr;
-PeerRecvFn g_peerRecvOrig = nullptr;
-bool g_peerSendHooked = false;
-bool g_peerRecvHooked = false;
-
-std::uintptr_t peerSendDetour(void* self, void* data, void* a2, void* a3, void* a4, void* a5) {
-    if (data) {
-        const auto* s = static_cast<const std::string*>(data);
-        if (!s->empty()) {
-            bactro::health::onOutgoingBatch(reinterpret_cast<const uint8_t*>(s->data()), s->size());
-        }
-    }
-    return g_peerSendOrig ? g_peerSendOrig(self, data, a2, a3, a4, a5) : 0;
-}
-
-std::uintptr_t peerRecvDetour(void* self, void* out, void* a2, void* a3) {
-    const std::uintptr_t ret = g_peerRecvOrig ? g_peerRecvOrig(self, out, a2, a3) : 1;
-    if (out) {
-        const auto* s = static_cast<const std::string*>(out);
-        const size_t n = s->size();
-        if (n > 0 && n < (1u << 22)) {
-            // Return convention is assumed (0 == data), not proven: parse on 0, and also when the buffer
-            // content changed since the last parse. Parsing is idempotent, so a repeat is harmless.
-            static std::uint64_t lastFp = 0;
-            std::uint64_t fp = 1469598103934665603ull ^ n;
-            const auto* d = reinterpret_cast<const uint8_t*>(s->data());
-            for (size_t i = 0; i < n && i < 48; ++i) fp = (fp ^ d[i]) * 1099511628211ull;
-            const bool ok = static_cast<std::uint32_t>(ret) == 0;
-            if (ok || fp != lastFp) {
-                lastFp = fp;
-                static std::atomic<int> logged{0};
-                if (logged.fetch_add(1) < 6) {
-                    char b[96];
-                    std::snprintf(b, sizeof(b), "in: receive ret=%d size=%zu", static_cast<int>(ret), n);
-                    writeStatus(b);
-                }
-                bactro::health::onRawGamePacket(d, n);
-            }
-        }
-    }
-    return ret;
-}
-
-bool installPeerHooks() {
-    if (!g_peerSendHooked) {
-        void* o = nullptr;
-        if (bactro::memory::hook(SignatureId::NetworkPeerReceive, reinterpret_cast<void*>(&peerSendDetour), &o)) {
-            g_peerSendOrig = reinterpret_cast<PeerSendFn>(o);
-            g_peerSendHooked = true;
-            LOGI("peer sendPacket hooked");
-            writeStatus("peer SEND hook OK");
-        } else {
-            writeStatus("peer SEND hook FAIL");
-        }
-    }
-    if (!g_peerRecvHooked) {
-        void* o = nullptr;
-        if (bactro::memory::hook(SignatureId::CompressedPeerReceive, reinterpret_cast<void*>(&peerRecvDetour), &o)) {
-            g_peerRecvOrig = reinterpret_cast<PeerRecvFn>(o);
-            g_peerRecvHooked = true;
-            LOGI("peer receivePacket hooked");
-            writeStatus("peer RECV hook OK");
-        } else {
-            writeStatus("peer RECV hook FAIL (signature missing or already hooked)");
-        }
-    }
-    return g_peerSendHooked || g_peerRecvHooked;
-}
-
-// ---- Fast Containers ----
-
-void* containerOpenDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
-    g_containerOpen.store(true, std::memory_order_release);
-    g_readyForNextOpen.store(false, std::memory_order_release);
-    return g_containerOpenOrig ? g_containerOpenOrig(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
-}
-
-void* containerCloseDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
-    void* r = g_containerCloseOrig ? g_containerCloseOrig(a0, a1, a2, a3, a4, a5, a6, a7) : nullptr;
-    g_containerOpen.store(false, std::memory_order_release);
-    g_readyForNextOpen.store(true, std::memory_order_release);
-    g_lastContainerCloseNs.store(monoNs(), std::memory_order_release);
-    return r;
-}
-
-InteractionResultValue useOnDetour(UseItemOnFn original, void* gm, void* item, const void* pos,
-                                   std::uint8_t face, const void* hit, const void* block, bool firstEvent) {
-    if (!original) return {};
-    if (wantsFastOpen()) {
-        InteractionResultValue result{};
-        for (int i = 0; i < 3; ++i) {
-            result = original(gm, item, pos, face, hit, block, true);
-            if (result.value != 0) break;
-        }
-        return result;
-    }
-    return original(gm, item, pos, face, hit, block, firstEvent);
-}
-
-InteractionResultValue gameModeUseItemOnDetour(void* gm, void* item, const void* pos, std::uint8_t face,
-                                               const void* hit, const void* block, bool firstEvent) {
-    return useOnDetour(g_useOnGame, gm, item, pos, face, hit, block, firstEvent);
-}
-
-InteractionResultValue survivalModeUseItemOnDetour(void* gm, void* item, const void* pos, std::uint8_t face,
-                                                   const void* hit, const void* block, bool firstEvent) {
-    return useOnDetour(g_useOnSurvival, gm, item, pos, face, hit, block, firstEvent);
-}
-
-bool interactDetour(InteractFn original, void* gm, void* target, const void* location) {
-    if (!original) return false;
-    bool result = original(gm, target, location);
-    if (wantsFastOpen() && !result) result = original(gm, target, location);
-    return result;
-}
-
-bool gameModeInteractDetour(void* gm, void* target, const void* location) {
-    return interactDetour(g_interactGame, gm, target, location);
-}
-
-bool survivalModeInteractDetour(void* gm, void* target, const void* location) {
-    return interactDetour(g_interactSurvival, gm, target, location);
-}
-
-bool tryHook(SignatureId id, void* detour, void** originalOut, const char* name, int& n) {
-    const auto addr = bactro::memory::resolve(id);
-    char line[192];
-    if (!addr) {
-        std::snprintf(line, sizeof(line), "FAIL %s: signature not found", name);
-        writeStatus(line);
-        LOGE("%s", line);
-        return false;
-    }
-    void* o = nullptr;
-    if (!bactro::memory::hook(id, detour, &o)) {
-        // Resolved but hook failed — often BedrockTools already hooked the same site
-        std::snprintf(line, sizeof(line), "FAIL %s: hook @%p (already hooked by another mod?)", name,
-                      reinterpret_cast<void*>(addr));
-        writeStatus(line);
-        LOGE("%s", line);
-        return false;
-    }
-    if (originalOut) *originalOut = o;
-    ++n;
-    std::snprintf(line, sizeof(line), "OK   %s @%p", name, reinterpret_cast<void*>(addr));
-    writeStatus(line);
-    LOGI("%s", line);
-    return true;
-}
-
-void installGameHooksFromResolved() {
-    // 1.26.51.1 crash on load was caused by SurvivalUseItemOn / GameModeInteract /
-    // ContainerClose detours (wrong target or ABI). Only install the proven-safe pair:
-    //   ContainerOpen  (state) + GameModeUseItemOn (firstEvent retries).
-    // Always-retry mode is used so we don't need close tracking.
-    int n = 0;
-    void* o = nullptr;
-
-    o = nullptr;
-    if (tryHook(SignatureId::ContainerScreenControllerOpen,
-                reinterpret_cast<void*>(&containerOpenDetour), &o, "ContainerOpen", n))
-        g_containerOpenOrig = reinterpret_cast<ScreenFn>(o);
-
-    o = nullptr;
-    if (tryHook(SignatureId::GameModeUseItemOn,
-                reinterpret_cast<void*>(&gameModeUseItemOnDetour), &o, "GameModeUseItemOn", n))
-        g_useOnGame = reinterpret_cast<UseItemOnFn>(o);
-
-    // Intentionally NOT hooked (caused load crash on 1.26.51.1):
-    //   ContainerClose, SurvivalUseItemOn, GameModeInteract, SurvivalInteract
-    writeStatus("skip ContainerClose SurvivalUseItemOn GameModeInteract SurvivalInteract (crash-safe)");
-
-    // Always allow fast open retries without close tracking
-    g_readyForNextOpen.store(true, std::memory_order_release);
-    g_containerOpen.store(false, std::memory_order_release);
-    writeStatus("always-retry mode ON");
-
-    LOGI("Fast Containers hooks: %d (safe set)", n);
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "hooks=%d/2-safe", n);
-    writeStatus(buf);
-}
-
 void resolveEverythingAsync() {
     std::thread([] {
-        LOGI("resolveAll starting (background)...");
         writeStatus("resolveAll starting...");
         const bool ok = bactro::memory::resolveAll("libminecraftpe.so");
         g_sigsReady.store(ok, std::memory_order_release);
-        LOGI("resolveAll done ok=%d", ok ? 1 : 0);
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "resolveAll done ok=%d", ok ? 1 : 0);
-            writeStatus(buf);
-        }
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "resolveAll done ok=%d", ok ? 1 : 0);
+        writeStatus(buf);
 
         const auto fb = bactro::memory::resolve(SignatureId::Fullbright);
         if (fb) {
             g_fullbrightTarget = reinterpret_cast<void*>(fb);
             std::memcpy(g_fullbrightOriginal, g_fullbrightTarget, 12);
-            LOGI("Fullbright @ %p", g_fullbrightTarget);
             writeStatus("fullbright target found");
             syncFullbright();
         } else {
-            LOGE("Fullbright missing");
             writeStatus("fullbright MISSING");
         }
 
-        {
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "peer send @ %p recv @ %p",
-                          reinterpret_cast<void*>(bactro::memory::resolve(SignatureId::NetworkPeerReceive)),
-                          reinterpret_cast<void*>(bactro::memory::resolve(SignatureId::CompressedPeerReceive)));
-            LOGI("%s", buf);
-            writeStatus(buf);
-        }
-
-        if (g_fastContainers.load(std::memory_order_relaxed))
-            installGameHooksFromResolved();
-        if (g_perfEnabled.load(std::memory_order_relaxed))
-            installTickHook();
-        // TargetHUD needs NormalTick for draw; ensure tick hook even if perf off
         installTickHook();
-        // TargetHUD data: outgoing attacks + incoming names/health (CompressedNetworkPeer)
-        installPeerHooks();
-        bactro::targethud::onSignaturesReady();
+        bactro::handshader::onSignaturesReady();
         writeStatus("async init finished");
     }).detach();
 }
@@ -467,13 +207,6 @@ void onPerfToggle(std::string_view, bool enabled) {
     }
 }
 
-void onFastToggle(std::string_view, bool enabled) {
-    g_fastContainers.store(enabled, std::memory_order_release);
-    if (enabled && g_sigsReady.load()) installGameHooksFromResolved();
-    if (enabled && !g_sigsReady.load()) resolveEverythingAsync();
-    LOGI("Fast Containers %s", enabled ? "ON" : "OFF");
-}
-
 void onPerfConfig(std::string_view, std::string_view key, std::string_view value) {
     try {
         if (key == "unlockFps") {
@@ -492,12 +225,10 @@ void onPerfConfig(std::string_view, std::string_view key, std::string_view value
     }
 }
 
-void onFastConfig(std::string_view, std::string_view, std::string_view) {}
-
 void registerMenus() {
     {
         pl::modmenu::ModuleBuilder b("bactro.performance", "Performance");
-        b.description("VSync unlock via eglSwapInterval only (keeps Levi FPS counter working) + Fullbright.")
+        b.description("VSync unlock + Fullbright.")
             .defaultEnabled(true)
             .onToggle(onPerfToggle)
             .onConfigChanged(onPerfConfig);
@@ -505,15 +236,7 @@ void registerMenus() {
         b.config("fullbright", "Fullbright", pl::modmenu::ConfigType::SliderFloat, "0", "0", "10", "");
         b.registerModule();
     }
-    {
-        pl::modmenu::ModuleBuilder b("bactro.fastcontainers", "Fast Containers");
-        b.description("After server opens a chest/shulker, close and open the next with no client wait.")
-            .defaultEnabled(true)
-            .onToggle(onFastToggle)
-            .onConfigChanged(onFastConfig);
-        b.registerModule();
-    }
-    bactro::targethud::registerModule();
+    bactro::handshader::registerModule();
 }
 
 } // namespace
@@ -530,7 +253,6 @@ public:
     }
 
     bool load(pl::mod::ModContext&) {
-        LOGI("load %s %s", bactro::Name.data(), bactro::Version.data());
         writeStatusReplace(std::string("load ") + std::string(bactro::Name) + " " +
                            std::string(bactro::Version) + "\n");
         return true;
@@ -539,23 +261,22 @@ public:
     bool enable(pl::mod::ModContext&) {
         registerMenus();
         installSwapIntervalHook();
-        writeStatus(g_swapIntervalHooked ? "eglSwapInterval OK" : "eglSwapInterval FAIL");
         resolveEverythingAsync();
         g_perfEnabled.store(true, std::memory_order_release);
-        LOGI("BactroNative enabled");
+        LOGI("BactroNative enabled (Hand Shader)");
         writeStatus("enabled");
         return true;
     }
 
     bool disable(pl::mod::ModContext&) {
         onPerfToggle("", false);
-        g_fastContainers.store(false, std::memory_order_release);
+        bactro::handshader::shutdown();
         return true;
     }
 
     bool unload(pl::mod::ModContext&) {
         onPerfToggle("", false);
-        g_fastContainers.store(false, std::memory_order_release);
+        bactro::handshader::shutdown();
         return true;
     }
 };
