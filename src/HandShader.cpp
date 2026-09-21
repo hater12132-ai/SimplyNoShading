@@ -14,13 +14,17 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 #define HS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
 
 using GLint = int;
 using GLsizei = int;
 using GLfloat = float;
+using GLenum = unsigned int;
+using GLboolean = unsigned char;
 
 namespace bactro::handshader {
 namespace {
@@ -29,15 +33,22 @@ constexpr const char* kModuleId = "bactro.handshader";
 
 std::atomic_bool g_enabled{true};
 std::atomic_bool g_rainbow{false};
-std::atomic<float> g_brightness{1.4f};
-std::atomic<float> g_tintR{0.55f};
+std::atomic<float> g_brightness{1.15f};
+std::atomic<float> g_tintR{1.0f};
 std::atomic<float> g_tintG{1.0f};
-std::atomic<float> g_tintB{1.35f};
+std::atomic<float> g_tintB{1.25f};
 std::atomic<float> g_opacity{1.0f};
 std::atomic_bool g_hideVanillaHand{false};
+std::atomic_bool g_tintEnabled{true};
 
 std::atomic_bool g_inHandRender{false};
 std::atomic_int g_uniformHits{0};
+std::atomic_int g_handOnlyHits{0};
+
+// Uniform locations seen while NOT rendering the hand → never tint these (shared with world).
+std::mutex g_locMu;
+std::unordered_set<GLint> g_worldLocations;
+std::unordered_set<GLint> g_handOnlyLocations;
 
 using RenderFirstPersonFn = void (*)(void* self, void* a1, void* a2, void* a3, void* a4, void* a5);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
@@ -82,7 +93,7 @@ void currentTint(float& r, float& g, float& b, float& a) {
         static auto start = std::chrono::steady_clock::now();
         const float sec =
             std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
-        hsvToRgb(std::fmod(sec * 0.2f, 1.f), 0.9f, 1.f, r, g, b);
+        hsvToRgb(std::fmod(sec * 0.2f, 1.f), 0.75f, 1.f, r, g, b);
     } else {
         r = g_tintR.load(std::memory_order_relaxed);
         g = g_tintG.load(std::memory_order_relaxed);
@@ -95,44 +106,94 @@ void currentTint(float& r, float& g, float& b, float& a) {
     a = g_opacity.load(std::memory_order_relaxed);
 }
 
-bool looksLikeColor(GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
-    auto ok = [](GLfloat x) { return x >= -0.05f && x <= 2.5f; };
-    return ok(v0) && ok(v1) && ok(v2) && ok(v3) && (v3 >= 0.f && v3 <= 1.05f);
+// Strict: only tint plausible albedo / color constants (not zeros, not alpha-0).
+bool looksLikeAlbedo(GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
+    if (v3 < 0.85f || v3 > 1.05f) return false; // need solid alpha
+    const float mx = std::fmax(v0, std::fmax(v1, v2));
+    const float mn = std::fmin(v0, std::fmin(v1, v2));
+    if (mx < 0.05f) return false;           // pure black — skip
+    if (mx > 1.6f) return false;            // already overbright / HDR constant
+    if (v0 < -0.01f || v1 < -0.01f || v2 < -0.01f) return false;
+    return true;
+}
+
+bool shouldTintLocation(GLint location) {
+    if (location < 0) return false;
+    std::lock_guard lock(g_locMu);
+    if (g_worldLocations.count(location)) return false; // shared with world — NEVER touch
+    g_handOnlyLocations.insert(location);
+    return true;
+}
+
+void markWorldLocation(GLint location) {
+    if (location < 0) return;
+    std::lock_guard lock(g_locMu);
+    g_worldLocations.insert(location);
 }
 
 void applyTint(GLfloat& v0, GLfloat& v1, GLfloat& v2, GLfloat& v3) {
-    if (!looksLikeColor(v0, v1, v2, v3)) return;
+    if (!looksLikeAlbedo(v0, v1, v2, v3)) return;
     float tr, tg, tb, ta;
     currentTint(tr, tg, tb, ta);
-    v0 *= tr;
-    v1 *= tg;
-    v2 *= tb;
-    v3 *= ta;
-    const int n = g_uniformHits.fetch_add(1, std::memory_order_relaxed);
-    if (n < 12) {
-        logLine("HandShader: tint uniform #%d -> (%.2f,%.2f,%.2f,%.2f)", n, v0, v1, v2, v3);
+    // Soft multiply toward tint (keep some original so it doesn't look broken)
+    constexpr float kMix = 0.65f;
+    v0 = v0 * (1.f - kMix) + v0 * tr * kMix;
+    v1 = v1 * (1.f - kMix) + v1 * tg * kMix;
+    v2 = v2 * (1.f - kMix) + v2 * tb * kMix;
+    v3 = v3 * ta;
+    // Clamp
+    auto clamp01 = [](GLfloat& x) {
+        if (x < 0.f) x = 0.f;
+        if (x > 2.f) x = 2.f;
+    };
+    clamp01(v0);
+    clamp01(v1);
+    clamp01(v2);
+    if (v3 > 1.f) v3 = 1.f;
+    if (v3 < 0.f) v3 = 0.f;
+
+    const int n = g_handOnlyHits.fetch_add(1, std::memory_order_relaxed);
+    if (n < 10) {
+        logLine("HandShader: hand-only tint #%d -> (%.2f,%.2f,%.2f,%.2f)", n, v0, v1, v2, v3);
     }
 }
 
 void glUniform4fDetour(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
-    if (g_enabled.load(std::memory_order_relaxed) && g_inHandRender.load(std::memory_order_acquire)) {
+    const bool inHand = g_inHandRender.load(std::memory_order_acquire);
+    if (!inHand) {
+        markWorldLocation(location);
+        if (g_glUniform4f) g_glUniform4f(location, v0, v1, v2, v3);
+        return;
+    }
+
+    if (g_enabled.load(std::memory_order_relaxed) && g_tintEnabled.load(std::memory_order_relaxed) &&
+        shouldTintLocation(location)) {
         applyTint(v0, v1, v2, v3);
+        g_uniformHits.fetch_add(1, std::memory_order_relaxed);
     }
     if (g_glUniform4f) g_glUniform4f(location, v0, v1, v2, v3);
 }
 
 void glUniform4fvDetour(GLint location, GLsizei count, const GLfloat* value) {
-    if (g_enabled.load(std::memory_order_relaxed) && g_inHandRender.load(std::memory_order_acquire) &&
-        value && count > 0) {
+    const bool inHand = g_inHandRender.load(std::memory_order_acquire);
+    if (!inHand) {
+        markWorldLocation(location);
+        if (g_glUniform4fv) g_glUniform4fv(location, count, value);
+        return;
+    }
+
+    if (g_enabled.load(std::memory_order_relaxed) && g_tintEnabled.load(std::memory_order_relaxed) &&
+        value && count > 0 && shouldTintLocation(location)) {
         GLfloat tmp[4] = {value[0], value[1], value[2], value[3]};
         applyTint(tmp[0], tmp[1], tmp[2], tmp[3]);
+        g_uniformHits.fetch_add(1, std::memory_order_relaxed);
         if (g_glUniform4fv) {
             if (count == 1) {
                 g_glUniform4fv(location, 1, tmp);
                 return;
             }
-            if (count <= 16) {
-                GLfloat buf[64];
+            if (count <= 8) {
+                GLfloat buf[32];
                 std::memcpy(buf, value, static_cast<size_t>(count) * 4 * sizeof(GLfloat));
                 buf[0] = tmp[0];
                 buf[1] = tmp[1];
@@ -176,7 +237,7 @@ void tryHookGles() {
     }
 
     g_glHooked = ok > 0;
-    logLine("HandShader: GLES color hooks %d/2", ok);
+    logLine("HandShader: GLES color hooks %d/2 (hand-only filter ON)", ok);
 }
 
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
@@ -194,13 +255,17 @@ void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4,
         return;
     }
 
+    // Brief window: only uniforms set during this call may be tinted, and only if
+    // that location was never used for the world.
     g_inHandRender.store(true, std::memory_order_release);
     if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
     g_inHandRender.store(false, std::memory_order_release);
 
     static int s_log = 0;
-    if (s_log < 3) {
-        logLine("HandShader: renderFirstPerson ok (hits=%d)", g_uniformHits.load());
+    if (s_log < 4) {
+        logLine("HandShader: renderFP ok hits=%d handOnly=%d worldLocs=%zu",
+                g_uniformHits.load(), g_handOnlyHits.load(),
+                (size_t)0 /* size under lock skipped */);
         ++s_log;
     }
 }
@@ -241,6 +306,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_opacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "hideHand")
             g_hideVanillaHand.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "tint")
+            g_tintEnabled.store(value == "true" || value == "1", std::memory_order_relaxed);
     } catch (...) {
     }
 }
@@ -249,15 +316,16 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Shader");
-    b.description("First-person hand/item color via GLES uniform hooks. Strong default cyan tint.")
+    b.description("Hand-only color tint (skips uniforms used by the world). Hide hand supported.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("brightness", "Brightness", pl::modmenu::ConfigType::SliderFloat, "1.4", "0.2", "3.0", "");
-    b.config("tintR", "Tint red", pl::modmenu::ConfigType::SliderFloat, "0.55", "0", "2", "");
+    b.config("tint", "Enable tint", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("brightness", "Brightness", pl::modmenu::ConfigType::SliderFloat, "1.15", "0.5", "2.0", "");
+    b.config("tintR", "Tint red", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
     b.config("tintG", "Tint green", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
-    b.config("tintB", "Tint blue", pl::modmenu::ConfigType::SliderFloat, "1.35", "0", "2", "");
-    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "1", "");
+    b.config("tintB", "Tint blue", pl::modmenu::ConfigType::SliderFloat, "1.25", "0", "2", "");
+    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.3", "1", "");
     b.config("rainbow", "Rainbow tint", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("hideHand", "Hide hand / item", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
