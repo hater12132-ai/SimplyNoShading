@@ -251,14 +251,18 @@ void dispatchPacket(const uint8_t* d, size_t n) {
 //   varuint64 targetRuntimeId, varuint32 actionType, ...
 void parseOutInventoryTransaction(const uint8_t* whole, size_t wholeLen, Reader r) {
     static std::atomic<int> dumped{0};
-    const bool dump = dumped.fetch_add(1) < 6;
+    const bool dump = dumped.fetch_add(1) < 8;
     bool hit = false;
     uint64_t rid = 0;
     uint32_t req = 0, type = 0, n = 0, act = 0;
-    if (r.readVarU32(req) && req == 0 && r.readVarU32(type) && type == 3 && r.readVarU32(n) && n == 0 &&
-        r.readVarU64(rid) && r.readVarU32(act) && act == 1) {
-        hit = true;
-        pushMyHit(rid);
+    // Standard: type 3 = UseItemOnEntity, act 1 = Attack
+    if (r.readVarU32(req) && r.readVarU32(type)) {
+        if (type == 3 && r.readVarU32(n) && r.readVarU64(rid) && r.readVarU32(act)) {
+            if (act == 1 && rid != 0) {
+                hit = true;
+                pushMyHit(rid);
+            }
+        }
     }
     if (dump || hit) {
         static std::atomic<int> hitLogs{0};

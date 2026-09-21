@@ -104,8 +104,16 @@ bool logBudget() {
 }
 
 bool plausiblePtr(void* p) {
-    const auto v = reinterpret_cast<std::uintptr_t>(p);
-    return v > 0x10000u && v < 0x0001000000000000ull && (v & 7u) == 0;
+    // Android ARM64 may set the top byte (TBI / MTE / PAC). Strip it before checks.
+    // Log showed "implausible" 0xb4000076… which is a normal heap ptr with tag 0xb4.
+    auto v = reinterpret_cast<std::uintptr_t>(p);
+    v &= 0x00FFFFFFFFFFFFFFULL;
+    return v > 0x10000u && (v & 7u) == 0;
+}
+
+void* stripPtr(void* p) {
+    auto v = reinterpret_cast<std::uintptr_t>(p) & 0x00FFFFFFFFFFFFFFULL;
+    return reinterpret_cast<void*>(v);
 }
 
 std::uint32_t withAlpha(std::uint32_t c, float a) {
@@ -381,19 +389,28 @@ void markDead() {
 // ---- attack detours ----
 void noteAttack(void* target, int slot) {
     if (!g_enabled.load() || !g_showOnHit.load()) return;
-    if (!plausiblePtr(target)) {
-        if (logBudget()) logLine("TargetHUD: %s fired with implausible target %p (wrong hook site?)",
-                                 kAttackNames[slot], target);
+    void* clean = stripPtr(target);
+    if (!plausiblePtr(clean)) {
+        // Try a2 as well — some prologues shuffle args; log both once
+        void* alt = stripPtr(reinterpret_cast<void*>(
+            reinterpret_cast<std::uintptr_t>(target))); // placeholder, real try in detour
+        if (logBudget()) logLine("TargetHUD: %s implausible target=%p stripped=%p",
+                                 kAttackNames[slot], target, clean);
         return;
     }
-    // Debug only: proves the attack body hook fires. The card itself comes from the packet path
-    // (exact runtime id); the native getNameTag signature matches 3 places on 1.26.51.1, so it is not called here.
-    if (logBudget()) logLine("TargetHUD: native attack via %s target=%p", kAttackNames[slot], target);
+    if (logBudget()) logLine("TargetHUD: attack via %s target=%p", kAttackNames[slot], clean);
+    try {
+        applyTarget(clean, true);
+    } catch (...) {
+    }
 }
 
 template <int Slot>
 std::uintptr_t attackDetour(void* a0, void* a1, void* a2, void* a3) {
-    noteAttack(a1, Slot);
+    // Prefer x1 (actor). If tagged/implausible, try x2 (some GameMode builds pass HitResult* then actor).
+    void* t = stripPtr(a1);
+    if (!plausiblePtr(t) && plausiblePtr(stripPtr(a2))) t = stripPtr(a2);
+    noteAttack(t, Slot);
     return g_attackOrig[Slot] ? g_attackOrig[Slot](a0, a1, a2, a3) : 0;
 }
 
@@ -747,10 +764,13 @@ void onFrame() {
         s_first = false;
         logLine("TargetHUD: onFrame running (NormalTick alive)");
     }
-    // Hits come from OUR outgoing attack packets (exact target runtime id). Incoming hurt events are ignored
-    // for target selection so other people's fights nearby don't steal the card.
+    // 1) Our outbound attack packets (when InvTx parses as UseItemOnEntity)
     for (uint64_t rid; bactro::health::popMyHit(rid);) applyRuntimeTarget(rid);
-    for (uint64_t drop; bactro::health::popHurt(drop);) {}
+    // 2) Incoming ActorEvent hurt — works on Hive (seen in 1.4.0 log). Prefer non-self.
+    //    For duels this is the reliable path; nearby fights may briefly steal the card.
+    for (uint64_t rid; bactro::health::popHurt(rid);) {
+        if (rid != 0 && rid != bactro::health::selfRuntimeId()) applyRuntimeTarget(rid);
+    }
     syncPacketHealth();
     tickAnim();
     submitHud();
