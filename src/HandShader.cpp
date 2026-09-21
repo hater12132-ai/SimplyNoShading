@@ -9,14 +9,11 @@
 #include <dlfcn.h>
 
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <string>
-#include <unordered_set>
 
 #define HS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
 
@@ -24,7 +21,7 @@ using GLint = int;
 using GLsizei = int;
 using GLfloat = float;
 using GLenum = unsigned int;
-using GLboolean = unsigned char;
+using GLuint = unsigned int;
 
 namespace bactro::handshader {
 namespace {
@@ -32,32 +29,28 @@ namespace {
 constexpr const char* kModuleId = "bactro.handshader";
 
 std::atomic_bool g_enabled{true};
-std::atomic_bool g_rainbow{false};
-std::atomic<float> g_brightness{1.15f};
-std::atomic<float> g_tintR{1.0f};
-std::atomic<float> g_tintG{1.0f};
-std::atomic<float> g_tintB{1.25f};
-std::atomic<float> g_opacity{1.0f};
 std::atomic_bool g_hideVanillaHand{false};
-std::atomic_bool g_tintEnabled{true};
+std::atomic<float> g_handScale{1.25f};
+std::atomic<float> g_handOffsetX{0.0f};
+std::atomic<float> g_handOffsetY{0.0f};
+std::atomic<float> g_handOffsetZ{0.0f};
 
-std::atomic_bool g_inHandRender{false};
-std::atomic_int g_uniformHits{0};
-std::atomic_int g_handOnlyHits{0};
-
-// Uniform locations seen while NOT rendering the hand → never tint these (shared with world).
-std::mutex g_locMu;
-std::unordered_set<GLint> g_worldLocations;
-std::unordered_set<GLint> g_handOnlyLocations;
+// True from first-person hand render until next buffer swap (hand is usually drawn late).
+std::atomic_bool g_handPhase{false};
+std::atomic_int g_matrixHits{0};
+std::atomic_int g_drawHits{0};
 
 using RenderFirstPersonFn = void (*)(void* self, void* a1, void* a2, void* a3, void* a4, void* a5);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
 bool g_renderFpHooked = false;
 
-using GlUniform4fFn = void (*)(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
-using GlUniform4fvFn = void (*)(GLint location, GLsizei count, const GLfloat* value);
-GlUniform4fFn g_glUniform4f = nullptr;
-GlUniform4fvFn g_glUniform4fv = nullptr;
+using GlUniformMatrix4fvFn = void (*)(GLint location, GLsizei count, unsigned char transpose, const GLfloat* value);
+using GlDrawElementsFn = void (*)(GLenum mode, GLsizei count, GLenum type, const void* indices);
+using GlDrawArraysFn = void (*)(GLenum mode, GLint first, GLsizei count);
+
+GlUniformMatrix4fvFn g_glUniformMatrix4fv = nullptr;
+GlDrawElementsFn g_glDrawElements = nullptr;
+GlDrawArraysFn g_glDrawArrays = nullptr;
 bool g_glHooked = false;
 
 void logLine(const char* fmt, ...) {
@@ -70,141 +63,70 @@ void logLine(const char* fmt, ...) {
     HS_LOGI("%s", buf);
 }
 
-void hsvToRgb(float h, float s, float v, float& r, float& g, float& b) {
-    h = std::fmod(h, 1.f);
-    if (h < 0.f) h += 1.f;
-    const float i = std::floor(h * 6.f);
-    const float f = h * 6.f - i;
-    const float p = v * (1.f - s);
-    const float q = v * (1.f - f * s);
-    const float t = v * (1.f - (1.f - f) * s);
-    switch (static_cast<int>(i) % 6) {
-    case 0: r = v; g = t; b = p; break;
-    case 1: r = q; g = v; b = p; break;
-    case 2: r = p; g = v; b = t; break;
-    case 3: r = p; g = q; b = v; break;
-    case 4: r = t; g = p; b = v; break;
-    default: r = v; g = p; b = q; break;
+// Scale + translate a 4x4 column-major matrix in-place (view / model matrix).
+void transformMatrix(GLfloat* m) {
+    if (!m) return;
+    const float s = g_handScale.load(std::memory_order_relaxed);
+    const float ox = g_handOffsetX.load(std::memory_order_relaxed);
+    const float oy = g_handOffsetY.load(std::memory_order_relaxed);
+    const float oz = g_handOffsetZ.load(std::memory_order_relaxed);
+
+    // Scale basis vectors (columns 0..2)
+    if (std::fabs(s - 1.f) > 0.001f) {
+        for (int col = 0; col < 3; ++col) {
+            m[col * 4 + 0] *= s;
+            m[col * 4 + 1] *= s;
+            m[col * 4 + 2] *= s;
+        }
     }
+    // Translate (column 3)
+    m[12] += ox;
+    m[13] += oy;
+    m[14] += oz;
 }
 
-void currentTint(float& r, float& g, float& b, float& a) {
-    if (g_rainbow.load(std::memory_order_relaxed)) {
-        static auto start = std::chrono::steady_clock::now();
-        const float sec =
-            std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
-        hsvToRgb(std::fmod(sec * 0.2f, 1.f), 0.75f, 1.f, r, g, b);
-    } else {
-        r = g_tintR.load(std::memory_order_relaxed);
-        g = g_tintG.load(std::memory_order_relaxed);
-        b = g_tintB.load(std::memory_order_relaxed);
-    }
-    const float br = g_brightness.load(std::memory_order_relaxed);
-    r *= br;
-    g *= br;
-    b *= br;
-    a = g_opacity.load(std::memory_order_relaxed);
-}
-
-// Strict: only tint plausible albedo / color constants (not zeros, not alpha-0).
-bool looksLikeAlbedo(GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
-    if (v3 < 0.85f || v3 > 1.05f) return false; // need solid alpha
-    const float mx = std::fmax(v0, std::fmax(v1, v2));
-    const float mn = std::fmin(v0, std::fmin(v1, v2));
-    if (mx < 0.05f) return false;           // pure black — skip
-    if (mx > 1.6f) return false;            // already overbright / HDR constant
-    if (v0 < -0.01f || v1 < -0.01f || v2 < -0.01f) return false;
-    return true;
-}
-
-bool shouldTintLocation(GLint location) {
-    if (location < 0) return false;
-    std::lock_guard lock(g_locMu);
-    if (g_worldLocations.count(location)) return false; // shared with world — NEVER touch
-    g_handOnlyLocations.insert(location);
-    return true;
-}
-
-void markWorldLocation(GLint location) {
-    if (location < 0) return;
-    std::lock_guard lock(g_locMu);
-    g_worldLocations.insert(location);
-}
-
-void applyTint(GLfloat& v0, GLfloat& v1, GLfloat& v2, GLfloat& v3) {
-    if (!looksLikeAlbedo(v0, v1, v2, v3)) return;
-    float tr, tg, tb, ta;
-    currentTint(tr, tg, tb, ta);
-    // Soft multiply toward tint (keep some original so it doesn't look broken)
-    constexpr float kMix = 0.65f;
-    v0 = v0 * (1.f - kMix) + v0 * tr * kMix;
-    v1 = v1 * (1.f - kMix) + v1 * tg * kMix;
-    v2 = v2 * (1.f - kMix) + v2 * tb * kMix;
-    v3 = v3 * ta;
-    // Clamp
-    auto clamp01 = [](GLfloat& x) {
-        if (x < 0.f) x = 0.f;
-        if (x > 2.f) x = 2.f;
-    };
-    clamp01(v0);
-    clamp01(v1);
-    clamp01(v2);
-    if (v3 > 1.f) v3 = 1.f;
-    if (v3 < 0.f) v3 = 0.f;
-
-    const int n = g_handOnlyHits.fetch_add(1, std::memory_order_relaxed);
-    if (n < 10) {
-        logLine("HandShader: hand-only tint #%d -> (%.2f,%.2f,%.2f,%.2f)", n, v0, v1, v2, v3);
-    }
-}
-
-void glUniform4fDetour(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
-    const bool inHand = g_inHandRender.load(std::memory_order_acquire);
-    if (!inHand) {
-        markWorldLocation(location);
-        if (g_glUniform4f) g_glUniform4f(location, v0, v1, v2, v3);
-        return;
-    }
-
-    if (g_enabled.load(std::memory_order_relaxed) && g_tintEnabled.load(std::memory_order_relaxed) &&
-        shouldTintLocation(location)) {
-        applyTint(v0, v1, v2, v3);
-        g_uniformHits.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (g_glUniform4f) g_glUniform4f(location, v0, v1, v2, v3);
-}
-
-void glUniform4fvDetour(GLint location, GLsizei count, const GLfloat* value) {
-    const bool inHand = g_inHandRender.load(std::memory_order_acquire);
-    if (!inHand) {
-        markWorldLocation(location);
-        if (g_glUniform4fv) g_glUniform4fv(location, count, value);
-        return;
-    }
-
-    if (g_enabled.load(std::memory_order_relaxed) && g_tintEnabled.load(std::memory_order_relaxed) &&
-        value && count > 0 && shouldTintLocation(location)) {
-        GLfloat tmp[4] = {value[0], value[1], value[2], value[3]};
-        applyTint(tmp[0], tmp[1], tmp[2], tmp[3]);
-        g_uniformHits.fetch_add(1, std::memory_order_relaxed);
-        if (g_glUniform4fv) {
+void glUniformMatrix4fvDetour(GLint location, GLsizei count, unsigned char transpose, const GLfloat* value) {
+    if (g_enabled.load(std::memory_order_relaxed) && g_handPhase.load(std::memory_order_acquire) && value &&
+        count > 0 && !g_hideVanillaHand.load(std::memory_order_relaxed)) {
+        // Only touch the first matrix (model/view). Copy then transform.
+        GLfloat tmp[16];
+        std::memcpy(tmp, value, 16 * sizeof(GLfloat));
+        transformMatrix(tmp);
+        const int n = g_matrixHits.fetch_add(1, std::memory_order_relaxed);
+        if (n < 6) {
+            logLine("HandShader: matrix scale=%.2f hit #%d loc=%d", g_handScale.load(), n, (int)location);
+        }
+        if (g_glUniformMatrix4fv) {
             if (count == 1) {
-                g_glUniform4fv(location, 1, tmp);
+                g_glUniformMatrix4fv(location, 1, transpose, tmp);
                 return;
             }
-            if (count <= 8) {
-                GLfloat buf[32];
-                std::memcpy(buf, value, static_cast<size_t>(count) * 4 * sizeof(GLfloat));
-                buf[0] = tmp[0];
-                buf[1] = tmp[1];
-                buf[2] = tmp[2];
-                buf[3] = tmp[3];
-                g_glUniform4fv(location, count, buf);
+            // count > 1: first matrix transformed, rest copied
+            if (count <= 4) {
+                GLfloat buf[64];
+                std::memcpy(buf, value, static_cast<size_t>(count) * 16 * sizeof(GLfloat));
+                std::memcpy(buf, tmp, 16 * sizeof(GLfloat));
+                g_glUniformMatrix4fv(location, count, transpose, buf);
                 return;
             }
         }
     }
-    if (g_glUniform4fv) g_glUniform4fv(location, count, value);
+    if (g_glUniformMatrix4fv) g_glUniformMatrix4fv(location, count, transpose, value);
+}
+
+void glDrawElementsDetour(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+    if (g_handPhase.load(std::memory_order_acquire)) {
+        const int n = g_drawHits.fetch_add(1, std::memory_order_relaxed);
+        if (n < 4) logLine("HandShader: drawElements in hand phase #%d count=%d", n, (int)count);
+    }
+    if (g_glDrawElements) g_glDrawElements(mode, count, type, indices);
+}
+
+void glDrawArraysDetour(GLenum mode, GLint first, GLsizei count) {
+    if (g_handPhase.load(std::memory_order_acquire)) {
+        g_drawHits.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (g_glDrawArrays) g_glDrawArrays(mode, first, count);
 }
 
 void tryHookGles() {
@@ -217,27 +139,31 @@ void tryHookGles() {
         return;
     }
 
-    void* u4f = dlsym(lib, "glUniform4f");
-    void* u4fv = dlsym(lib, "glUniform4fv");
     int ok = 0;
-
-    if (u4f) {
+    if (void* p = dlsym(lib, "glUniformMatrix4fv")) {
         void* o = nullptr;
-        if (pl::memory::hook(u4f, reinterpret_cast<void*>(&glUniform4fDetour), &o) == 0) {
-            g_glUniform4f = reinterpret_cast<GlUniform4fFn>(o);
+        if (pl::memory::hook(p, reinterpret_cast<void*>(&glUniformMatrix4fvDetour), &o) == 0) {
+            g_glUniformMatrix4fv = reinterpret_cast<GlUniformMatrix4fvFn>(o);
             ++ok;
         }
     }
-    if (u4fv) {
+    if (void* p = dlsym(lib, "glDrawElements")) {
         void* o = nullptr;
-        if (pl::memory::hook(u4fv, reinterpret_cast<void*>(&glUniform4fvDetour), &o) == 0) {
-            g_glUniform4fv = reinterpret_cast<GlUniform4fvFn>(o);
+        if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawElementsDetour), &o) == 0) {
+            g_glDrawElements = reinterpret_cast<GlDrawElementsFn>(o);
+            ++ok;
+        }
+    }
+    if (void* p = dlsym(lib, "glDrawArrays")) {
+        void* o = nullptr;
+        if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawArraysDetour), &o) == 0) {
+            g_glDrawArrays = reinterpret_cast<GlDrawArraysFn>(o);
             ++ok;
         }
     }
 
     g_glHooked = ok > 0;
-    logLine("HandShader: GLES color hooks %d/2 (hand-only filter ON)", ok);
+    logLine("HandShader: GLES matrix/draw hooks %d/3 (no color tint)", ok);
 }
 
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
@@ -255,17 +181,16 @@ void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4,
         return;
     }
 
-    // Brief window: only uniforms set during this call may be tinted, and only if
-    // that location was never used for the world.
-    g_inHandRender.store(true, std::memory_order_release);
+    // Hand phase stays on until end of this call. Matrix/draw hooks only act while set.
+    // (Uniforms for hand are often set inside this call tree even if color vec4s are not.)
+    g_handPhase.store(true, std::memory_order_release);
     if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
-    g_inHandRender.store(false, std::memory_order_release);
+    g_handPhase.store(false, std::memory_order_release);
 
     static int s_log = 0;
-    if (s_log < 4) {
-        logLine("HandShader: renderFP ok hits=%d handOnly=%d worldLocs=%zu",
-                g_uniformHits.load(), g_handOnlyHits.load(),
-                (size_t)0 /* size under lock skipped */);
+    if (s_log < 5) {
+        logLine("HandShader: renderFP ok matrix=%d draw=%d scale=%.2f", g_matrixHits.load(),
+                g_drawHits.load(), g_handScale.load());
         ++s_log;
     }
 }
@@ -292,22 +217,16 @@ void onToggle(std::string_view, bool enabled) {
 
 void onConfig(std::string_view, std::string_view key, std::string_view value) {
     try {
-        if (key == "rainbow")
-            g_rainbow.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "brightness")
-            g_brightness.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "tintR")
-            g_tintR.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "tintG")
-            g_tintG.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "tintB")
-            g_tintB.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "opacity")
-            g_opacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        if (key == "handScale")
+            g_handScale.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "offsetX")
+            g_handOffsetX.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "offsetY")
+            g_handOffsetY.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "offsetZ")
+            g_handOffsetZ.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "hideHand")
             g_hideVanillaHand.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "tint")
-            g_tintEnabled.store(value == "true" || value == "1", std::memory_order_relaxed);
     } catch (...) {
     }
 }
@@ -316,17 +235,14 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Shader");
-    b.description("Hand-only color tint (skips uniforms used by the world). Hide hand supported.")
+    b.description("Viewmodel scale/offset for first-person hand. Color tint removed (broke world). Hide hand works.")
         .defaultEnabled(true)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("tint", "Enable tint", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("brightness", "Brightness", pl::modmenu::ConfigType::SliderFloat, "1.15", "0.5", "2.0", "");
-    b.config("tintR", "Tint red", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
-    b.config("tintG", "Tint green", pl::modmenu::ConfigType::SliderFloat, "1.0", "0", "2", "");
-    b.config("tintB", "Tint blue", pl::modmenu::ConfigType::SliderFloat, "1.25", "0", "2", "");
-    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.3", "1", "");
-    b.config("rainbow", "Rainbow tint", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("handScale", "Hand scale", pl::modmenu::ConfigType::SliderFloat, "1.25", "0.4", "2.5", "");
+    b.config("offsetX", "Offset X", pl::modmenu::ConfigType::SliderFloat, "0", "-1", "1", "");
+    b.config("offsetY", "Offset Y", pl::modmenu::ConfigType::SliderFloat, "0", "-1", "1", "");
+    b.config("offsetZ", "Offset Z", pl::modmenu::ConfigType::SliderFloat, "0", "-1", "1", "");
     b.config("hideHand", "Hide hand / item", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
 }
@@ -335,7 +251,7 @@ void onSignaturesReady() { tryInstallHooks(); }
 void onFrame() {}
 void shutdown() {
     g_enabled.store(false, std::memory_order_release);
-    g_inHandRender.store(false, std::memory_order_release);
+    g_handPhase.store(false, std::memory_order_release);
 }
 
 } // namespace bactro::handshader
