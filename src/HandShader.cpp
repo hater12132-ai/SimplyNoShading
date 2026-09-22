@@ -54,6 +54,18 @@ std::atomic_bool g_handPhase{false};
 std::atomic_int g_drawHits{0};
 std::atomic_int g_glowHits{0};
 
+// Hard cap on how many draw calls within one hand-phase window can be treated as "the hand".
+// The window is intentionally wide (renderFirstPerson -> eglSwapBuffers) because the hand mesh
+// is submitted late/deferred, but a wide window alone is unsafe: ordinary terrain is rendered
+// as many small per-chunk-section draw calls that can also be under the vertex-count threshold,
+// so without a budget the world ends up getting the additive glow + relaxed depth-func treatment
+// too (this was the cause of chunks flickering/glowing — the "glitching world" bug). The hand +
+// held item together are only ever a handful of draw calls (arm, item mesh, occasionally a
+// second layer), so a small budget reset each time the hand phase starts is a safe backstop even
+// if the window ends up wider than expected on a given frame.
+constexpr int kMaxHandDrawsPerPhase = 6;
+std::atomic_int g_handDrawBudget{0};
+
 using RenderFirstPersonFn = void (*)(void* self, void* a1, void* a2, void* a3, void* a4, void* a5);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
 bool g_renderFpHooked = false;
@@ -148,9 +160,17 @@ bool isTriangleMode(GLenum mode) {
 
 // Only glow small-ish draws (hand/item), skip huge world chunks if phase is wide.
 bool looksLikeHandDraw(GLsizei count) {
-    // Hand/item meshes are small. World chunks are large.
-    return count > 0 && count < 4000;
+    // Hand/item meshes are small (typically a few dozen to a few hundred vertices).
+    // 4000 was far too permissive — plenty of individual world-chunk-section draw calls
+    // fall under that too, which is what let the glow leak onto terrain. Tightened to a
+    // range that still comfortably covers hand + item geometry but excludes most chunk
+    // batches. Combined with the per-phase draw budget below as a second safety net.
+    return count > 0 && count < 1500;
 }
+
+// True only while we still have "hand draw" budget left for this phase. Consumed by the
+// detours below; see kMaxHandDrawsPerPhase for why this exists.
+bool hasHandDrawBudget() { return g_handDrawBudget.load(std::memory_order_relaxed) > 0; }
 
 void applyGlowSecondPass(void (*drawOnce)(void*), void* ctx) {
     if (!g_glow.load(std::memory_order_relaxed) || !g_glEnable || !g_glBlendFunc) {
@@ -164,6 +184,7 @@ void applyGlowSecondPass(void (*drawOnce)(void*), void* ctx) {
     if (g_glDepthFunc) g_glDepthFunc(GL_LEQUAL);
     drawOnce(ctx); // additive
     restoreBlend(snap);
+    g_handDrawBudget.fetch_sub(1, std::memory_order_relaxed);
     const int n = g_glowHits.fetch_add(1, std::memory_order_relaxed);
     if (n < 8) logLine("HandShader: glow pass #%d", n);
 }
@@ -226,7 +247,7 @@ void doDRE(void* p) {
 
 bool inHandGlowWindow() {
     return g_enabled.load(std::memory_order_relaxed) && g_handPhase.load(std::memory_order_acquire) &&
-           !g_hideVanillaHand.load(std::memory_order_relaxed);
+           !g_hideVanillaHand.load(std::memory_order_relaxed) && hasHandDrawBudget();
 }
 
 void glDrawElementsDetour(GLenum mode, GLsizei count, GLenum type, const void* indices) {
@@ -285,6 +306,7 @@ void glDrawRangeElementsDetour(GLenum mode, GLuint start, GLuint end, GLsizei co
 EGLBoolean eglSwapBuffersDetour(EGLDisplay dpy, EGLSurface surface) {
     // End hand phase for this frame (hand was submitted earlier in the frame).
     g_handPhase.store(false, std::memory_order_release);
+    g_handDrawBudget.store(0, std::memory_order_relaxed);
     return g_eglSwapBuffers ? g_eglSwapBuffers(dpy, surface) : EGL_FALSE;
 }
 
@@ -371,7 +393,9 @@ void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4,
         return;
     }
 
-    // Stay active until eglSwapBuffers clears it (deferred draws).
+    // Stay active until eglSwapBuffers clears it (deferred draws), but only for a bounded
+    // number of draw calls — see kMaxHandDrawsPerPhase.
+    g_handDrawBudget.store(kMaxHandDrawsPerPhase, std::memory_order_relaxed);
     g_handPhase.store(true, std::memory_order_release);
     if (g_renderFpOriginal) g_renderFpOriginal(self, a1, a2, a3, a4, a5);
     // do NOT clear handPhase here
@@ -400,7 +424,10 @@ void tryInstallHooks() {
 
 void onToggle(std::string_view, bool enabled) {
     g_enabled.store(enabled, std::memory_order_release);
-    if (!enabled) g_handPhase.store(false, std::memory_order_release);
+    if (!enabled) {
+        g_handPhase.store(false, std::memory_order_release);
+        g_handDrawBudget.store(0, std::memory_order_relaxed);
+    }
 }
 
 void onConfig(std::string_view, std::string_view key, std::string_view value) {
@@ -431,6 +458,7 @@ void onFrame() {}
 void shutdown() {
     g_enabled.store(false, std::memory_order_release);
     g_handPhase.store(false, std::memory_order_release);
+    g_handDrawBudget.store(0, std::memory_order_relaxed);
 }
 
 } // namespace bactro::handshader

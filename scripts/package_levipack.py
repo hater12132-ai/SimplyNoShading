@@ -16,11 +16,11 @@ def main() -> int:
         "type": "preload-native",
         "name": "BactroNative",
         "author": "hater12132-ai",
-        "version": "1.4.0",
+        "version": "1.5.6",
         "entry": "libBactroNative.so",
         "icon": "icon.png",
-        "minecraft_versions": ["1.26.5X.X"],
-        "description": "Performance (FPS unlock) + Fast Containers + Target HUD.",
+        "minecraft_versions": ["1.26.51.1"],
+        "description": "Performance (VSync unlock, fullbright) + Hand Shader (first-person hand/item glow).",
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
