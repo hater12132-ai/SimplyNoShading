@@ -1,5 +1,6 @@
 #include "bactro/Signatures.hpp"
 #include "bactro/HandShader.hpp"
+#include "bactro/MotionBlur.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
 
@@ -183,6 +184,7 @@ void resolveEverythingAsync() {
 
         installTickHook();
         bactro::handshader::onSignaturesReady();
+        bactro::motionblur::onSignaturesReady();
         writeStatus("async init finished");
     }).detach();
 }
@@ -237,6 +239,7 @@ void registerMenus() {
         b.registerModule();
     }
     bactro::handshader::registerModule();
+    bactro::motionblur::registerModule();
 }
 
 } // namespace
@@ -271,12 +274,14 @@ public:
     bool disable(pl::mod::ModContext&) {
         onPerfToggle("", false);
         bactro::handshader::shutdown();
+        bactro::motionblur::shutdown();
         return true;
     }
 
     bool unload(pl::mod::ModContext&) {
         onPerfToggle("", false);
         bactro::handshader::shutdown();
+        bactro::motionblur::shutdown();
         return true;
     }
 };
